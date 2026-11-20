@@ -401,6 +401,9 @@ export async function runPushScraper(
             if (config.JDOWNLOADER_AUTOSTART) {
               await jdownloader.moveToDownloadList(packageLinks.map(l => l.uuid));
               await jdownloader.startDownloads();
+              console.log(`  🚀 Moved ${packageLinks.length} link(s) to download list and started downloads`);
+            } else {
+              console.log(`  ⏸️ JDOWNLOADER_AUTOSTART is false — left ${packageLinks.length} link(s) in linkgrabber`);
             }
           } else {
             if (removeLinkIds.length > 0) {
@@ -410,6 +413,9 @@ export async function runPushScraper(
             if (config.JDOWNLOADER_AUTOSTART) {
               await jdownloader.moveToDownloadList(keepLinks.map(l => l.uuid));
               await jdownloader.startDownloads();
+              console.log(`  🚀 Moved ${keepLinks.length} link(s) to download list and started downloads`);
+            } else {
+              console.log(`  ⏸️ JDOWNLOADER_AUTOSTART is false — left ${keepLinks.length} link(s) in linkgrabber`);
             }
             console.log(
               `  ✅ Pushed: "${packageName}" ${rangeLabel} (${keepLinks.length} file(s), filtered from ${packageLinks.length})`,
