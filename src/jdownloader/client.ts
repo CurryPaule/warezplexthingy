@@ -159,7 +159,7 @@ export class JDownloaderClient {
   }
 
   /**
-   * Move links from linkgrabber to the download list (starts them).
+   * Move links from linkgrabber to the download list.
    * JD API expects positional params: [linkIds[], packageIds[]]
    */
   async moveToDownloadList(linkIds?: number[], packageIds?: number[]): Promise<void> {
@@ -167,6 +167,18 @@ export class JDownloaderClient {
       '/linkgrabberv2/moveToDownloadlist',
       this.deviceId,
       [linkIds ?? [], packageIds ?? []],
+    );
+  }
+
+  /**
+   * Start downloads in JDownloader's download list.
+   * Needed after moveToDownloadList when links were added with autostart=false.
+   */
+  async startDownloads(): Promise<void> {
+    await (this.client as any).callAction(
+      '/downloadcontroller/start',
+      this.deviceId,
+      [],
     );
   }
 }

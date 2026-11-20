@@ -288,9 +288,17 @@ async function processSeriesBucket(
     return { enriched: 0, updated: 0, skipped: 1 };
   }
 
-  // Highest episode already tracked for this bucket
-  const lastEp = hasRecheck
+  // Highest episode already tracked for this bucket.
+  // On re-check, use the minimum of match.Episode and watchlist.LastEpisodeFound (when set)
+  // so manually lowering LastEpisodeFound in the Watchlist table triggers a re-download,
+  // while multi-season shows with a lower match.Episode still track their own season accurately.
+  const maxMatchEp = hasRecheck
     ? Math.max(...recheckEntries.map(e => e.match.Episode ?? 0))
+    : 0;
+  const lastEp = hasRecheck
+    ? (watchlistItem.LastEpisodeFound != null
+      ? Math.min(maxMatchEp, watchlistItem.LastEpisodeFound)
+      : maxMatchEp)
     : (watchlistItem.LastEpisodeFound ?? 0);
 
   // Split into season packs vs individual episodes

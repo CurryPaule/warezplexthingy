@@ -176,6 +176,7 @@ describe('runPushScraper — multi-episode & multi-part bugfixes', () => {
       queryLinks: vi.fn(async () => linkSnapshots[linkCallIdx++] ?? linkSnapshots[linkSnapshots.length - 1]!),
       removeLinks: vi.fn(async () => {}),
       moveToDownloadList: vi.fn(async () => {}),
+      startDownloads: vi.fn(async () => {}),
     };
 
     const nocodbMocks = {
@@ -192,8 +193,9 @@ describe('runPushScraper — multi-episode & multi-part bugfixes', () => {
 
     // Must have removed ONLY old episode E04 parts (and NEVER touched unrelatedLink 999)
     expect(jdMocks.removeLinks).toHaveBeenCalledWith([101, 102]);
-    // Must have moved ALL 6 parts of E05 AND E06!
+    // Must have moved ALL 6 parts of E05 AND E06 and started downloads!
     expect(jdMocks.moveToDownloadList).toHaveBeenCalledWith([201, 202, 203, 301, 302, 303]);
+    expect(jdMocks.startDownloads).toHaveBeenCalledTimes(1);
     expect(nocodbMocks.updateMatchRelease).toHaveBeenCalledWith(10, { Status: 'pushed' });
   });
 
@@ -219,6 +221,7 @@ describe('runPushScraper — multi-episode & multi-part bugfixes', () => {
       queryLinks: vi.fn(async () => linkSnapshots[idx++] ?? [p1, p2, p3]),
       removeLinks: vi.fn(async () => {}),
       moveToDownloadList: vi.fn(async () => {}),
+      startDownloads: vi.fn(async () => {}),
     };
 
     const nocodbMocks = {
@@ -246,6 +249,7 @@ describe('runPushScraper — multi-episode & multi-part bugfixes', () => {
       queryLinks: vi.fn(async () => []),
       removeLinks: vi.fn(async () => {}),
       moveToDownloadList: vi.fn(async () => {}),
+      startDownloads: vi.fn(async () => {}),
     };
 
     const nocodbMocks = {
@@ -290,6 +294,7 @@ describe('runPushScraper — multi-episode & multi-part bugfixes', () => {
       }),
       removeLinks: vi.fn(async () => {}),
       moveToDownloadList: vi.fn(async () => {}),
+      startDownloads: vi.fn(async () => {}),
     };
 
     const nocodbMocks = {
@@ -326,6 +331,7 @@ describe('runPushScraper — multi-episode & multi-part bugfixes', () => {
       queryLinks: vi.fn(async () => snapshots[idx++] ?? [p1, p2]),
       removeLinks: vi.fn(async () => {}),
       moveToDownloadList: vi.fn(async () => {}),
+      startDownloads: vi.fn(async () => {}),
     };
 
     const nocodbMocks = {

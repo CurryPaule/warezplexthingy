@@ -180,6 +180,33 @@ describe('runEnrichScraper — multi-episode season packs', () => {
     expect(nocodbMocks.updateWatchlistEpisode).toHaveBeenCalledWith(1, 6);
   });
 
+  it('detects episodes to re-download when user lowers LastEpisodeFound in watchlist (even if match.Episode is still higher)', async () => {
+    const { nocodb, nocodbMocks, warez } = createMocks({
+      recheckSeries: [
+        makeMatch({ Status: 'processed', Episode: 6, SeasonEpisodeKey: 'S02E06' }),
+      ],
+      watchlist: { 1: makeWatchlistItem({ LastEpisodeFound: 4 }) },
+      releasesByUid: {
+        'uid-lotr': [makeRelease({ options: { episode_count_in_season: '6' } })],
+      },
+    });
+
+    await runEnrichScraper(warez, nocodb, TEST_CONFIG, {
+      sleepFn: noopSleep,
+      isHosterOnlineFn: alwaysOnline,
+    });
+
+    expect(nocodbMocks.updateMatchRelease).toHaveBeenCalledWith(
+      10,
+      expect.objectContaining({
+        Episode: 6,
+        SeasonEpisodeKey: 'S02E05-E06',
+        Status: 'matched',
+      }),
+    );
+    expect(nocodbMocks.updateWatchlistEpisode).toHaveBeenCalledWith(1, 6);
+  });
+
   it('encodes 10 new episodes S02E03-E12 when jumping from E02 to E12', async () => {
     const { nocodb, nocodbMocks, warez } = createMocks({
       recheckSeries: [

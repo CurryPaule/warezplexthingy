@@ -400,6 +400,7 @@ export async function runPushScraper(
             console.log(`  ⚠ No links match episode pattern ${episodePattern} — keeping all ${packageLinks.length} link(s)`);
             if (config.JDOWNLOADER_AUTOSTART) {
               await jdownloader.moveToDownloadList(packageLinks.map(l => l.uuid));
+              await jdownloader.startDownloads();
             }
           } else {
             if (removeLinkIds.length > 0) {
@@ -408,6 +409,7 @@ export async function runPushScraper(
             }
             if (config.JDOWNLOADER_AUTOSTART) {
               await jdownloader.moveToDownloadList(keepLinks.map(l => l.uuid));
+              await jdownloader.startDownloads();
             }
             console.log(
               `  ✅ Pushed: "${packageName}" ${rangeLabel} (${keepLinks.length} file(s), filtered from ${packageLinks.length})`,
