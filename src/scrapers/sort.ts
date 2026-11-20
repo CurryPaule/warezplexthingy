@@ -2,22 +2,33 @@ import type { NocoDbClient } from '../nocodb/client';
 import type { MatchRow } from '../nocodb/types';
 import type { FileBrowserClient, FileBrowserItem } from '../filebrowser/client';
 import type { Config } from '../config';
-import { extractTitleFromFulltitle } from '../matcher';
+import {
+  extractEpisode,
+  extractSeasonEpisodeKey,
+  extractTitleFromFulltitle,
+} from '../matcher';
 
 const VIDEO_EXTENSIONS = new Set(['.mkv', '.mp4', '.avi', '.m4v', '.wmv', '.flv', '.mov', '.ts']);
 const SUBTITLE_EXTENSIONS = new Set(['.srt', '.sub', '.ass', '.ssa', '.vtt', '.idx']);
+const ARCHIVE_OR_TEMP_EXTENSIONS = new Set(['.rar', '.zip', '.7z', '.part', '.jd2', '.tmp', '.crdownload']);
+const SPLIT_RAR_EXT_PATTERN = /^\.r\d{2}$/i;
 
-interface DownloadMetadata {
+export interface DownloadMetadata {
   imdbId: string;
   type: 'movie' | 'series';
-  seasonEpisodeKey?: string; // e.g. "S02E05" or "S02"
+  seasonEpisodeKey?: string; // e.g. "S02E05", "S02E04-E06", or "S02"
 }
 
-interface SortResult {
+export interface SortResult {
   success: boolean;
   movedFiles: string[];
   destination: string;
   error?: string;
+}
+
+export interface VideoWithSubtitles {
+  video: FileBrowserItem;
+  subtitles: FileBrowserItem[];
 }
 
 /**
@@ -26,10 +37,10 @@ interface SortResult {
  * Examples:
  *   tt1234567-movie
  *   tt0903747-series-S02E05
+ *   tt0903747-series-S02E04-E06
  *   tt0903747-series-S02
  */
 export function parseDownloadMetadata(dirName: string): DownloadMetadata | null {
-  // Match imdb ID, type, and optional season/episode
   const match = /^(tt\d+)-(movie|series)(?:-(.+))?$/.exec(dirName);
   if (!match) return null;
 
@@ -67,6 +78,17 @@ function getExtension(filename: string): string {
   return filename.slice(lastDot).toLowerCase();
 }
 
+function stripExtension(filename: string): string {
+  const lastDot = filename.lastIndexOf('.');
+  return lastDot === -1 ? filename : filename.slice(0, lastDot);
+}
+
+function parentDirOf(filePath: string): string {
+  const normalized = filePath.replace(/\/+$/, '');
+  const lastSlash = normalized.lastIndexOf('/');
+  return lastSlash <= 0 ? '' : normalized.slice(0, lastSlash);
+}
+
 function isVideoFile(filename: string): boolean {
   return VIDEO_EXTENSIONS.has(getExtension(filename));
 }
@@ -75,9 +97,14 @@ function isSubtitleFile(filename: string): boolean {
   return SUBTITLE_EXTENSIONS.has(getExtension(filename));
 }
 
+function isArchiveOrTempFile(filename: string): boolean {
+  const ext = getExtension(filename);
+  return ARCHIVE_OR_TEMP_EXTENSIONS.has(ext) || SPLIT_RAR_EXT_PATTERN.test(ext);
+}
+
 /**
- * Extract season number from a SeasonEpisodeKey.
- * e.g. "S02E05" → "S02", "S02" → "S02"
+ * Extract season directory from a SeasonEpisodeKey.
+ * e.g. "S02E05" → "S02", "S02E04-E06" → "S02", "S02" → "S02"
  */
 function extractSeasonDir(key: string): string {
   const match = /^(S\d{2})/i.exec(key);
@@ -86,9 +113,9 @@ function extractSeasonDir(key: string): string {
 
 /**
  * Build the destination path for a movie.
- * Format: {moviesPath}/{Title (year)}/
+ * Format: {moviesPath}/{Title (year)}
  */
-function buildMovieDestination(
+export function buildMovieDestination(
   moviesPath: string,
   matchRecord: MatchRow,
 ): string {
@@ -99,10 +126,10 @@ function buildMovieDestination(
 }
 
 /**
- * Build the destination path for a TV show episode.
- * Format: {showsPath}/{Title (year)}/{S01}/
+ * Build the destination path for a TV show season.
+ * Format: {showsPath}/{Title (year)}/{S01}
  */
-function buildShowDestination(
+export function buildShowDestination(
   showsPath: string,
   matchRecord: MatchRow,
   seasonEpisodeKey?: string,
@@ -133,7 +160,7 @@ function isSampleFile(item: FileBrowserItem): boolean {
  * Subtitles can be next to video files or in a subs/ subdirectory.
  * Sample files are excluded.
  */
-function categorizeFiles(items: FileBrowserItem[]): {
+export function categorizeFiles(items: FileBrowserItem[]): {
   videos: FileBrowserItem[];
   subtitles: FileBrowserItem[];
 } {
@@ -154,17 +181,117 @@ function categorizeFiles(items: FileBrowserItem[]): {
 }
 
 /**
+ * Check whether remaining files in a download directory still include active videos,
+ * archives, or partial downloads (e.g. sibling episodes still being downloaded/extracted).
+ */
+export function hasActiveFiles(items: FileBrowserItem[]): boolean {
+  return items.some(item => {
+    if (item.isDir) return false;
+    if (isArchiveOrTempFile(item.name)) return true;
+    if (isVideoFile(item.name) && !isSampleFile(item)) return true;
+    return false;
+  });
+}
+
+/**
+ * Pair subtitles with their corresponding episode video so multi-episode folders
+ * never collide on subtitle filenames or dump different episodes into one folder.
+ */
+export function groupShowFilesByVideo(
+  videos: FileBrowserItem[],
+  subtitles: FileBrowserItem[],
+): { groups: VideoWithSubtitles[]; unmatchedSubtitles: FileBrowserItem[] } {
+  const groups: VideoWithSubtitles[] = videos.map(video => ({ video, subtitles: [] }));
+  const unmatchedSubtitles: FileBrowserItem[] = [];
+
+  if (subtitles.length === 0) {
+    return { groups, unmatchedSubtitles };
+  }
+
+  if (groups.length === 1) {
+    groups[0]!.subtitles.push(...subtitles);
+    return { groups, unmatchedSubtitles };
+  }
+
+  const videoMeta = groups.map(group => ({
+    group,
+    dir: parentDirOf(group.video.path),
+    stemLower: stripExtension(group.video.name).toLowerCase(),
+    epKey: extractSeasonEpisodeKey(group.video.name) ?? extractSeasonEpisodeKey(group.video.path),
+  }));
+
+  for (const sub of subtitles) {
+    // 1. Deepest ancestor directory match (e.g. /dl/Show.S02E04/Subs/de.srt → /dl/Show.S02E04/Show.S02E04.mkv)
+    const dirCandidates = videoMeta.filter(v => v.dir && sub.path.startsWith(`${v.dir}/`));
+    let pool = videoMeta;
+    if (dirCandidates.length > 0) {
+      const maxLen = Math.max(...dirCandidates.map(v => v.dir.length));
+      const deepest = dirCandidates.filter(v => v.dir.length === maxLen);
+      if (deepest.length === 1) {
+        deepest[0]!.group.subtitles.push(sub);
+        continue;
+      }
+      pool = deepest;
+    }
+
+    // 2. Filename stem prefix match (e.g. Show.S02E04.de.srt → Show.S02E04.mkv)
+    const subStemLower = stripExtension(sub.name).toLowerCase();
+    const stemMatch = pool.find(v => subStemLower.startsWith(v.stemLower));
+    if (stemMatch) {
+      stemMatch.group.subtitles.push(sub);
+      continue;
+    }
+
+    // 3. Episode key match (e.g. both contain S02E04)
+    const subEpKey = extractSeasonEpisodeKey(sub.name) ?? extractSeasonEpisodeKey(sub.path);
+    if (subEpKey) {
+      const epMatch = pool.find(v => v.epKey && v.epKey === subEpKey);
+      if (epMatch) {
+        epMatch.group.subtitles.push(sub);
+        continue;
+      }
+    }
+
+    unmatchedSubtitles.push(sub);
+  }
+
+  return { groups, unmatchedSubtitles };
+}
+
+/**
+ * Derive a clean per-episode directory name when a TV episode has subtitles.
+ * Prefers the video's own filename stem so multi-episode season packs never clash.
+ */
+function resolveEpisodeDirName(
+  video: FileBrowserItem,
+  totalVideos: number,
+  matchRecord: MatchRow,
+  fallbackKey: string,
+): string {
+  const videoStem = stripExtension(video.name);
+  if (totalVideos > 1 || extractSeasonEpisodeKey(videoStem) != null) {
+    return videoStem || fallbackKey;
+  }
+
+  if (matchRecord.Fulltitle && extractEpisode(matchRecord.Fulltitle) != null) {
+    return cleanEpisodeDirName(matchRecord.Fulltitle, fallbackKey);
+  }
+
+  return videoStem || cleanEpisodeDirName(matchRecord.Fulltitle || '', fallbackKey);
+}
+
+/**
  * Sort a completed download into the correct Plex/Jellyfin directory.
  *
  * For movies:
  *   {moviesPath}/Movie Title (year)/full.release.name.mkv
  *
  * For TV shows without subtitles:
- *   {showsPath}/Show Title (year)/S01/full.release.name.mkv
+ *   {showsPath}/Show Title (year)/S01/episode.video.mkv
  *
- * For TV shows with subtitles:
- *   {showsPath}/Show Title (year)/S01/{SeasonEpisodeKey}/full.release.name.mkv
- *   {showsPath}/Show Title (year)/S01/{SeasonEpisodeKey}/subs/subtitle.srt
+ * For TV shows with subtitles (per episode):
+ *   {showsPath}/Show Title (year)/S01/{EpisodeDir}/episode.video.mkv
+ *   {showsPath}/Show Title (year)/S01/{EpisodeDir}/subs/subtitle.srt
  */
 export async function sortDownload(
   fb: FileBrowserClient,
@@ -191,9 +318,8 @@ export async function sortDownload(
   }
 
   // Determine the directory to scan for files
-  // scanPath is the full path provided (e.g. "/output/tt36586751-movie/Release.Name")
-  // If not provided, fall back to FILEBROWSER_DOWNLOAD_PATH + dirName
-  const downloadDir = scanPath || `${config.FILEBROWSER_DOWNLOAD_PATH}/${downloadDirName}`;
+  const baseDownloadPath = config.FILEBROWSER_DOWNLOAD_PATH?.replace(/\/+$/, '');
+  const downloadDir = scanPath || (baseDownloadPath ? `${baseDownloadPath}/${downloadDirName}` : '');
   if (!downloadDir) {
     return { success: false, movedFiles: [], destination: '', error: 'No scan path and FILEBROWSER_DOWNLOAD_PATH not configured' };
   }
@@ -202,7 +328,7 @@ export async function sortDownload(
   console.log(`     IMDB: ${metadata.imdbId}, Type: ${metadata.type}, Key: ${metadata.seasonEpisodeKey || 'n/a'}`);
 
   // Look up match in NocoDB
-  let matchRecord: (MatchRow & { Id: number }) | null;
+  let matchRecord: (MatchRow & { Id: number }) | null = null;
   if (metadata.seasonEpisodeKey) {
     matchRecord = await nocodb.getMatchByImdbIdAndEpisode(metadata.imdbId, metadata.seasonEpisodeKey);
   }
@@ -262,41 +388,50 @@ export async function sortDownload(
       console.log(`     ✅ Moved subtitle: ${sub.name}`);
     }
   } else {
-    // TV shows
-    if (subtitles.length === 0) {
-      // No subs — just put video files directly in the season directory
-      await fb.createDir(destination);
+    // TV shows: pair subtitles per video so multi-episode batches sort cleanly without collisions
+    const { groups, unmatchedSubtitles } = groupShowFilesByVideo(videos, subtitles);
+    const fallbackKey = metadata.seasonEpisodeKey || matchRecord.SeasonEpisodeKey || 'unknown';
+    let createdSeasonDir = false;
 
-      for (const video of videos) {
+    for (const { video, subtitles: videoSubs } of groups) {
+      if (videoSubs.length === 0) {
+        if (!createdSeasonDir) {
+          await fb.createDir(destination);
+          createdSeasonDir = true;
+        }
         const dest = `${destination}/${video.name}`;
         await fb.move(video.path, dest);
         movedFiles.push(dest);
         console.log(`     ✅ Moved: ${video.name}`);
+      } else {
+        const episodeDirName = resolveEpisodeDirName(video, videos.length, matchRecord, fallbackKey);
+        const episodePath = `${destination}/${episodeDirName}`;
+        const subsPath = `${episodePath}/subs`;
+
+        await fb.createDir(episodePath);
+        await fb.createDir(subsPath);
+
+        const videoDest = `${episodePath}/${video.name}`;
+        await fb.move(video.path, videoDest);
+        movedFiles.push(videoDest);
+        console.log(`     ✅ Moved: ${video.name} → ${episodeDirName}/`);
+
+        for (const sub of videoSubs) {
+          const subDest = `${subsPath}/${sub.name}`;
+          await fb.move(sub.path, subDest);
+          movedFiles.push(subDest);
+          console.log(`     ✅ Moved subtitle: ${sub.name}`);
+        }
       }
-    } else {
-      // Has subs — create episode subdirectory with subs folder
-      const episodeDir = metadata.seasonEpisodeKey || matchRecord.SeasonEpisodeKey || 'unknown';
-      // Use the fulltitle or SeasonEpisodeKey for the episode directory name
-      const episodeDirName = matchRecord.Fulltitle
-        ? cleanEpisodeDirName(matchRecord.Fulltitle, episodeDir)
-        : episodeDir;
-      const episodePath = `${destination}/${episodeDirName}`;
-      const subsPath = `${episodePath}/subs`;
+    }
 
-      await fb.createDir(episodePath);
-      await fb.createDir(subsPath);
-
-      for (const video of videos) {
-        const dest = `${episodePath}/${video.name}`;
-        await fb.move(video.path, dest);
-        movedFiles.push(dest);
-        console.log(`     ✅ Moved: ${video.name}`);
-      }
-
-      for (const sub of subtitles) {
-        const dest = `${subsPath}/${sub.name}`;
-        await fb.move(sub.path, dest);
-        movedFiles.push(dest);
+    if (unmatchedSubtitles.length > 0) {
+      const sharedSubsPath = `${destination}/subs`;
+      await fb.createDir(sharedSubsPath);
+      for (const sub of unmatchedSubtitles) {
+        const subDest = `${sharedSubsPath}/${sub.name}`;
+        await fb.move(sub.path, subDest);
+        movedFiles.push(subDest);
         console.log(`     ✅ Moved subtitle: ${sub.name}`);
       }
     }
@@ -308,26 +443,32 @@ export async function sortDownload(
   });
   console.log(`     📋 Updated match status to "processed"`);
 
-  // Try to clean up empty source directories (release dir, then metadata dir)
+  // Clean up source directory ONLY if no active media/archive/partial files remain
+  // (e.g. sibling episodes from a multi-episode season pack still downloading or extracting)
   try {
-    await fb.delete(downloadDir);
-    console.log(`     🗑️ Cleaned up source directory: ${downloadDir}`);
+    const remainingFiles = await fb.listDirRecursive(downloadDir);
+    if (hasActiveFiles(remainingFiles)) {
+      console.log(`     ⏳ Keeping source directory (other videos/archives still present): ${downloadDir}`);
+    } else {
+      await fb.delete(downloadDir);
+      console.log(`     🗑️ Cleaned up source directory: ${downloadDir}`);
 
-    // Also try to clean up the metadata parent dir if it's now empty
-    const parentDir = downloadDir.replace(/\/[^/]+\/?$/, '');
-    if (parentDir && parentDir !== downloadDir) {
-      try {
-        const remaining = await fb.listDir(parentDir);
-        if (remaining.length === 0) {
-          await fb.delete(parentDir);
-          console.log(`     🗑️ Cleaned up metadata directory: ${parentDir}`);
+      // Also try to clean up the metadata parent dir if it's now empty (never delete baseDownloadPath itself)
+      const parentDir = parentDirOf(downloadDir);
+      if (parentDir && parentDir !== downloadDir && parentDir !== baseDownloadPath) {
+        try {
+          const remaining = await fb.listDir(parentDir);
+          if (remaining.length === 0) {
+            await fb.delete(parentDir);
+            console.log(`     🗑️ Cleaned up metadata directory: ${parentDir}`);
+          }
+        } catch {
+          // Parent dir cleanup is best-effort
         }
-      } catch {
-        // Parent dir cleanup is best-effort
       }
     }
   } catch {
-    console.log(`     ⚠ Could not delete source directory (may not be empty): ${downloadDir}`);
+    console.log(`     ⚠ Could not clean up source directory: ${downloadDir}`);
   }
 
   return { success: true, movedFiles, destination };
@@ -335,13 +476,8 @@ export async function sortDownload(
 
 /**
  * Build a clean episode directory name.
- * Prefers the full release name if it contains the season/episode key,
- * otherwise falls back to just the key.
- * e.g. "Scrubs.2026.S01E02.Whatever" → "Scrubs.2026.S01E02.Whatever"
- *      (or "S01E02" if no fulltitle)
  */
 function cleanEpisodeDirName(fulltitle: string, fallbackKey: string): string {
-  // Remove file extension if somehow present
   const cleaned = fulltitle.replace(/\.(mkv|mp4|avi|m4v|wmv|flv|mov|ts)$/i, '');
   return cleaned || fallbackKey;
 }

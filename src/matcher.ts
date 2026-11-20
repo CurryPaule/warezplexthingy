@@ -26,22 +26,24 @@ export function normalizeTitle(raw: string): string {
 export function extractTitleFromFulltitle(fulltitle: string): string {
   const normalized = normalizeTitle(fulltitle);
 
-  // Cut off at common release markers
+  // Cut off at common release markers (only when not at start of title, e.g. movie "1917")
   const cutPatterns = [
-    /\b\d{4}\b/,              // year (e.g. 2026)
-    /\bs\d{2}\b/,             // season marker (e.g. s01)
-    /\b(?:german|english|french|spanish|italian|dutch)\b/i,
-    /\b(?:dl|multi)\b/i,
-    /\b(?:720p|1080p|2160p|4k|uhd|hd|sd)\b/i,
-    /\b(?:web|bluray|blu-ray|dvd|hdtv|webrip|hdcam)\b/i,
-    /\b(?:h264|h265|x264|x265|hevc|avc|xvid)\b/i,
+    /\b\d{4}\b/g,              // year (e.g. 2026)
+    /\bs\d{2}(?=e\d|\b)/g,     // season or season+episode marker (e.g. s01, s01e02)
+    /\b(?:german|english|french|spanish|italian|dutch)\b/gi,
+    /\b(?:dl|multi)\b/gi,
+    /\b(?:720p|1080p|2160p|4k|uhd|hd|sd)\b/gi,
+    /\b(?:web|bluray|blu-ray|dvd|hdtv|webrip|hdcam)\b/gi,
+    /\b(?:h264|h265|x264|x265|hevc|avc|xvid)\b/gi,
   ];
 
   let cutIdx = normalized.length;
   for (const pattern of cutPatterns) {
-    const match = pattern.exec(normalized);
-    if (match && match.index < cutIdx) {
-      cutIdx = match.index;
+    for (const match of normalized.matchAll(pattern)) {
+      if (match.index !== undefined && match.index > 0 && match.index < cutIdx) {
+        cutIdx = match.index;
+        break;
+      }
     }
   }
 
@@ -53,8 +55,11 @@ export function matchesQuality(releaseQuality: string | null, requiredQuality: s
   if (!requiredQuality) return true;
   if (!releaseQuality) return false;
 
-  const relTier = QUALITY_TIERS[releaseQuality.toLowerCase()] ?? 0;
-  const reqTier = QUALITY_TIERS[requiredQuality.toLowerCase()] ?? 0;
+  const relLower = releaseQuality.toLowerCase();
+  const reqLower = requiredQuality.toLowerCase();
+  const relTier = QUALITY_TIERS[relLower] ?? 0;
+  const reqTier = QUALITY_TIERS[reqLower] ?? 0;
+  if (reqTier === 0) return relLower === reqLower;
   return relTier === reqTier;
 }
 
@@ -133,9 +138,9 @@ export function matchesTags(fulltitle: string, tags: string | string[] | undefin
   return required.every(tag => ft.includes(tag));
 }
 
-/** Extract season number from fulltitle, e.g. "S02" → 2, null if not found */
+/** Extract season number from fulltitle, e.g. "S02" or "S02E05" → 2, null if not found */
 export function extractSeason(fulltitle: string): number | null {
-  const match = /\bS(\d{2})\b/i.exec(fulltitle);
+  const match = /\bS(\d{2})(?=E\d|\b)/i.exec(fulltitle);
   if (!match) return null;
   return parseInt(match[1]!, 10);
 }
@@ -147,6 +152,11 @@ export function extractEpisode(fulltitle: string): number | null {
   return parseInt(match[1]!, 10);
 }
 
+/** Returns true when a release fulltitle represents a season pack rather than an individual episode */
+export function isSeasonPackFulltitle(fulltitle: string): boolean {
+  return extractEpisode(fulltitle) === null;
+}
+
 /** Extract season + episode as a dedup key, e.g. "S02E05" → "S02E05", "S02" → "S02", null if none */
 export function extractSeasonEpisodeKey(fulltitle: string): string | null {
   // Try S01E05 first
@@ -156,6 +166,99 @@ export function extractSeasonEpisodeKey(fulltitle: string): string | null {
   const season = /\b(S\d{2})\b/i.exec(fulltitle);
   if (season) return season[1]!.toUpperCase();
   return null;
+}
+
+export interface EpisodeRange {
+  season?: number;
+  fromEpisode: number;
+  toEpisode: number;
+  episodes: number[];
+}
+
+/**
+ * Format a season + episode (or episode range) into a SeasonEpisodeKey.
+ * Examples:
+ *   formatSeasonEpisodeKey(2, 5)       → "S02E05"
+ *   formatSeasonEpisodeKey(2, 5, 5)    → "S02E05"
+ *   formatSeasonEpisodeKey(2, 4, 6)    → "S02E04-E06"
+ *   formatSeasonEpisodeKey(null, 4, 6) → "E04-E06"
+ */
+export function formatSeasonEpisodeKey(
+  season: number | null | undefined,
+  fromEpisode: number,
+  toEpisode: number = fromEpisode,
+): string {
+  const seasonPrefix = season != null ? `S${String(season).padStart(2, '0')}` : '';
+  const fromStr = `E${String(fromEpisode).padStart(2, '0')}`;
+  if (toEpisode > fromEpisode) {
+    const toStr = `E${String(toEpisode).padStart(2, '0')}`;
+    return `${seasonPrefix}${fromStr}-${toStr}`;
+  }
+  return `${seasonPrefix}${fromStr}`;
+}
+
+/**
+ * Parse a SeasonEpisodeKey (single episode or range) into an EpisodeRange.
+ * Supports:
+ *   "S02E04-E06" / "S02E04-06" → { season: 2, fromEpisode: 4, toEpisode: 6, episodes: [4, 5, 6] }
+ *   "S02E05"                   → { season: 2, fromEpisode: 5, toEpisode: 5, episodes: [5] }
+ *   "E04-E06"                  → { season: fallbackSeason, fromEpisode: 4, toEpisode: 6, episodes: [4, 5, 6] }
+ *   "S02" + fallbackEpisode=5  → { season: 2, fromEpisode: 5, toEpisode: 5, episodes: [5] }
+ */
+export function parseEpisodeRange(
+  seasonEpisodeKey: string | null | undefined,
+  fallbackSeason?: number,
+  fallbackEpisode?: number,
+): EpisodeRange | null {
+  if (seasonEpisodeKey) {
+    const rangeMatch = /^(?:S(\d{2}))?E(\d{1,3})-E?(\d{1,3})$/i.exec(seasonEpisodeKey.trim());
+    if (rangeMatch) {
+      const season = rangeMatch[1] ? parseInt(rangeMatch[1], 10) : fallbackSeason;
+      const fromEpisode = parseInt(rangeMatch[2]!, 10);
+      const toEpisode = parseInt(rangeMatch[3]!, 10);
+      if (fromEpisode > 0 && toEpisode >= fromEpisode) {
+        const episodes: number[] = [];
+        for (let ep = fromEpisode; ep <= toEpisode; ep++) episodes.push(ep);
+        return { season, fromEpisode, toEpisode, episodes };
+      }
+    }
+
+    const singleMatch = /^(?:S(\d{2}))?E(\d{1,3})$/i.exec(seasonEpisodeKey.trim());
+    if (singleMatch) {
+      const season = singleMatch[1] ? parseInt(singleMatch[1], 10) : fallbackSeason;
+      const episode = parseInt(singleMatch[2]!, 10);
+      if (episode > 0) {
+        return { season, fromEpisode: episode, toEpisode: episode, episodes: [episode] };
+      }
+    }
+
+    const seasonOnlyMatch = /^S(\d{2})$/i.exec(seasonEpisodeKey.trim());
+    if (seasonOnlyMatch && fallbackEpisode != null && fallbackEpisode > 0) {
+      const season = parseInt(seasonOnlyMatch[1]!, 10);
+      return { season, fromEpisode: fallbackEpisode, toEpisode: fallbackEpisode, episodes: [fallbackEpisode] };
+    }
+  }
+
+  if (fallbackEpisode != null && fallbackEpisode > 0) {
+    return {
+      season: fallbackSeason,
+      fromEpisode: fallbackEpisode,
+      toEpisode: fallbackEpisode,
+      episodes: [fallbackEpisode],
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Build a regex that matches filenames/packages for ANY episode in `episodes`.
+ * Uses `(?!\d)` so e.g. E04 never matches E040, and allows optional dot/underscore/dash between Sxx and Exx.
+ */
+export function buildEpisodesPattern(season: number | undefined, episodes: number[]): RegExp {
+  const seasonStr = season != null ? `S${String(season).padStart(2, '0')}` : 'S\\d{2}';
+  const episodeTokens = episodes.map(ep => (ep < 10 ? `0?${ep}` : String(ep)));
+  return new RegExp(`${seasonStr}[._-]?E(?:${episodeTokens.join('|')})(?!\\d)`, 'i');
 }
 
 export interface MatchResult {

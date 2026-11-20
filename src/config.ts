@@ -1,5 +1,20 @@
 import { z } from 'zod';
 
+/**
+ * Parse boolean environment variables properly.
+ * Note: z.coerce.boolean() treats the non-empty string "false" as true (Boolean("false") === true).
+ */
+const envBoolean = z.preprocess((val) => {
+  if (typeof val === 'boolean') return val;
+  if (typeof val === 'number') return val !== 0;
+  if (typeof val === 'string') {
+    const normalized = val.trim().toLowerCase();
+    if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+    if (['false', '0', 'no', 'off', ''].includes(normalized)) return false;
+  }
+  return val;
+}, z.boolean());
+
 const ConfigSchema = z.object({
   NOCODB_URL: z.string().url(),
   NOCODB_API_KEY: z.string().min(1),
@@ -19,7 +34,7 @@ const ConfigSchema = z.object({
   JDOWNLOADER_EMAIL: z.string().email().optional(),
   JDOWNLOADER_PASSWORD: z.string().min(1).optional(),
   JDOWNLOADER_DEVICE_NAME: z.string().min(1).optional(),
-  JDOWNLOADER_AUTOSTART: z.coerce.boolean().default(false),
+  JDOWNLOADER_AUTOSTART: envBoolean.default(false),
   JDOWNLOADER_HOSTER_PRIORITY: z.string().default('ddownload,rapidgator'),
 
   // REST API server
@@ -35,6 +50,10 @@ const ConfigSchema = z.object({
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
+
+export function parseConfig(env: Record<string, string | undefined>): Config {
+  return ConfigSchema.parse(env);
+}
 
 let _config: Config | null = null;
 
