@@ -1,24 +1,41 @@
 import type { NocoDbClient } from '../nocodb/client';
 import type { MatchRow } from '../nocodb/types';
-import type { JDownloaderClient } from '../jdownloader/client';
+import type { CrawledLink, CrawledPackage, JDownloaderClient } from '../jdownloader/client';
 import type { Config } from '../config';
+import {
+  buildEpisodesPattern,
+  formatSeasonEpisodeKey,
+  isSeasonPackFulltitle,
+  parseEpisodeRange,
+  type EpisodeRange,
+} from '../matcher';
+import { sleep } from '../utils';
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+/** Default delay in ms between polls for JDownloader to resolve container links */
+const DEFAULT_POLL_DELAY_MS = 1500;
+/** Default max attempts to poll linkgrabber (~60s at 1.5s interval) */
+const DEFAULT_POLL_MAX_ATTEMPTS = 40;
+/** Consecutive polls with unchanged link UUIDs (while not collecting) required before acting */
+const DEFAULT_STABLE_POLLS_REQUIRED = 2;
+
+const GENERIC_EPISODE_MARKER = /S\d{2}[._-]?E\d{1,3}(?!\d)/i;
+
+export interface PushOptions {
+  pollDelayMs?: number;
+  maxPollAttempts?: number;
+  stablePollsRequired?: number;
+  sleepFn?: (ms: number) => Promise<void>;
 }
-
-/** Delay in ms between polls for JDownloader to resolve container links */
-const LINKGRABBER_RESOLVE_DELAY_MS = 1000;
-/** Max attempts to poll linkgrabber for resolved links */
-const LINKGRABBER_POLL_MAX_ATTEMPTS = 15;
 
 /**
  * Build a metadata-encoded download path for JDownloader.
- * Format: {imdbId}-{type}[-S{season}E{episode}]
- * This path is used as the package subfolder so JDownloader's webhook
- * carries the metadata back when the download completes.
+ * Format: {imdbId}-{type}[-{seasonEpisodeKey}]
+ * Examples:
+ *   tt1234567-movie
+ *   tt7631058-series-S02E05
+ *   tt7631058-series-S02E04-E06
  */
-function buildMetadataPath(match: MatchRow): string {
+export function buildMetadataPath(match: MatchRow): string {
   const parts: string[] = [];
 
   const imdbId = match.ImdbId || 'unknown';
@@ -37,7 +54,7 @@ function buildMetadataPath(match: MatchRow): string {
  * CryptedLinks is a JSON-serialized Record<string, string> (hoster → container URL).
  * JDownloader can resolve the actual download links from the container URL.
  */
-function selectCryptedLink(
+export function selectCryptedLink(
   cryptedLinksJson: string | undefined,
   hosterPriority: string[],
 ): { url: string; hoster: string } | null {
@@ -70,37 +87,249 @@ function selectCryptedLink(
 }
 
 /**
- * Build a regex pattern that matches filenames for a specific episode.
- * E.g., for episode 5 in season 4: matches "S04E05" in the filename.
+ * Determine whether a match requires linkgrabber episode filtering and return the target range.
+ *
+ * Filtering is ONLY needed when:
+ * 1. The match is a series season pack (container holds all episodes, not a single episode release)
+ * 2. We have a target episode range starting AFTER episode 1 (fromEpisode > 1), meaning earlier
+ *    episodes were already downloaded and should be stripped from the linkgrabber.
+ *
+ * Movies, individual episode uploads, and first-time season packs starting at E01 push directly.
  */
-function buildEpisodePattern(season: number | undefined, episode: number): RegExp {
-  const seasonStr = season != null ? `S${String(season).padStart(2, '0')}` : 'S\\d{2}';
-  const episodeStr = `E${String(episode).padStart(2, '0')}`;
-  return new RegExp(`${seasonStr}${episodeStr}`, 'i');
+export function getEpisodeFilterRange(match: MatchRow): EpisodeRange | null {
+  if (match.Type !== 'series') return null;
+  if (match.Fulltitle && !isSeasonPackFulltitle(match.Fulltitle)) return null;
+
+  const range = parseEpisodeRange(match.SeasonEpisodeKey, match.Season, match.Episode);
+  if (!range) return null;
+  if (range.fromEpisode <= 1) return null;
+
+  return range;
+}
+
+function normalizeForPrefix(value: string): string {
+  return value.toLowerCase().replace(/[._\-]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 /**
- * Determine if a match is a series re-check that needs episode filtering.
- * A re-check is a series that was previously pushed/processed and now has a new episode.
+ * Identify newly crawled links in JDownloader's linkgrabber that belong to this push.
+ *
+ * Primary strategy: match new links (not in `existingLinkUuids`) whose package `saveTo`
+ * contains `metadataPath` or whose package `name` matches `packageName`.
+ * Fallback strategy: match new links whose normalized filename starts with the normalized
+ * first two tokens of `packageName`.
  */
-function isSeriesRecheck(match: MatchRow): boolean {
-  return match.Type === 'series' && match.Episode != null && match.Episode > 0;
+export function findPushedLinks(
+  allLinks: CrawledLink[],
+  packages: CrawledPackage[],
+  existingLinkUuids: Set<number>,
+  metadataPath: string,
+  packageName: string,
+): { links: CrawledLink[]; packageByUuid: Map<string, CrawledPackage> } {
+  const packageByUuid = new Map<string, CrawledPackage>();
+  for (const pkg of packages) {
+    packageByUuid.set(String(pkg.uuid), pkg);
+  }
+
+  const newLinks = allLinks.filter(l => !existingLinkUuids.has(l.uuid));
+  if (newLinks.length === 0) {
+    return { links: [], packageByUuid };
+  }
+
+  const metadataLower = metadataPath.toLowerCase();
+  const packageNameLower = packageName.toLowerCase();
+
+  // Primary: match by package saveTo (contains our unique metadata path) or exact package name
+  const matchedPackageUuids = new Set<string>();
+  for (const pkg of packages) {
+    const saveToLower = pkg.saveTo.toLowerCase();
+    const nameLower = pkg.name.toLowerCase();
+    if (
+      (metadataLower && saveToLower.includes(metadataLower)) ||
+      (packageNameLower && nameLower === packageNameLower)
+    ) {
+      matchedPackageUuids.add(String(pkg.uuid));
+    }
+  }
+
+  if (matchedPackageUuids.size > 0) {
+    const byPackage = newLinks.filter(l => matchedPackageUuids.has(l.packageUUID));
+    if (byPackage.length > 0) {
+      return { links: byPackage, packageByUuid };
+    }
+  }
+
+  // Fallback: match by normalized release prefix (handles dots/underscores/spaces variations)
+  const prefixTokens = normalizeForPrefix(packageName).split(' ').slice(0, 2).join(' ');
+  if (!prefixTokens) {
+    return { links: newLinks, packageByUuid };
+  }
+
+  const byPrefix = newLinks.filter(l => normalizeForPrefix(l.name).startsWith(prefixTokens));
+  return { links: byPrefix, packageByUuid };
+}
+
+/**
+ * Partition pushed links into links to keep (matching target episodes) and links to remove.
+ * Checks `link.name` first; if the filename has no episode marker at all, falls back to its package name.
+ */
+export function partitionLinksByEpisodes(
+  packageLinks: CrawledLink[],
+  packageByUuid: Map<string, CrawledPackage>,
+  episodePattern: RegExp,
+): { keepLinks: CrawledLink[]; removeLinkIds: number[] } {
+  const keepLinks: CrawledLink[] = [];
+  const removeLinkIds: number[] = [];
+
+  for (const link of packageLinks) {
+    if (episodePattern.test(link.name)) {
+      keepLinks.push(link);
+      continue;
+    }
+
+    // If the link filename itself has no SxxExx marker, fall back to its package name
+    if (!GENERIC_EPISODE_MARKER.test(link.name)) {
+      const pkg = packageByUuid.get(link.packageUUID);
+      if (pkg && episodePattern.test(pkg.name)) {
+        keepLinks.push(link);
+        continue;
+      }
+    }
+
+    removeLinkIds.push(link.uuid);
+  }
+
+  return { keepLinks, removeLinkIds };
+}
+
+/**
+ * Poll JDownloader's linkgrabber until the pushed container finishes crawling AND
+ * the set of resolved link UUIDs remains stable across consecutive polls.
+ *
+ * Waiting for `!isCollecting()` + stability prevents the race condition where only
+ * the first part(s) of a multi-part episode archive have been crawled when we move links.
+ */
+async function waitForResolvedLinks(
+  jdownloader: JDownloaderClient,
+  existingLinkUuids: Set<number>,
+  metadataPath: string,
+  packageName: string,
+  opts: Required<PushOptions>,
+): Promise<{
+  resolved: boolean;
+  packageLinks: CrawledLink[];
+  packageByUuid: Map<string, CrawledPackage>;
+}> {
+  let lastSignature = '';
+  let stableCount = 0;
+  let isCollectingSupported = true;
+  let lastLinks: CrawledLink[] = [];
+  let lastPackageByUuid = new Map<string, CrawledPackage>();
+
+  await opts.sleepFn(opts.pollDelayMs);
+
+  for (let attempt = 0; attempt < opts.maxPollAttempts; attempt++) {
+    let collecting = false;
+    if (isCollectingSupported) {
+      try {
+        collecting = await jdownloader.isCollecting();
+      } catch (err) {
+        isCollectingSupported = false;
+        console.warn(
+          `  ⚠ isCollecting() unavailable, falling back to link-count stability check:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+
+    let packages: CrawledPackage[] = [];
+    try {
+      packages = await jdownloader.queryPackages();
+    } catch {
+      // Fallback to filename-prefix matching if queryPackages is unavailable
+    }
+
+    const allLinks = await jdownloader.queryLinks();
+    const { links: packageLinks, packageByUuid } = findPushedLinks(
+      allLinks,
+      packages,
+      existingLinkUuids,
+      metadataPath,
+      packageName,
+    );
+
+    lastLinks = packageLinks;
+    lastPackageByUuid = packageByUuid;
+
+    if (packageLinks.length === 0) {
+      stableCount = 0;
+      lastSignature = '';
+      console.log(`  ⏳ No links resolved yet (attempt ${attempt + 1}/${opts.maxPollAttempts})`);
+      await opts.sleepFn(opts.pollDelayMs);
+      continue;
+    }
+
+    const signature = packageLinks
+      .map(l => l.uuid)
+      .sort((a, b) => a - b)
+      .join(',');
+
+    if (collecting) {
+      // JDownloader is still crawling/checking links — do not finalize partial results!
+      stableCount = 0;
+      lastSignature = signature;
+      console.log(`  ⏳ Still collecting links (${packageLinks.length} found so far, attempt ${attempt + 1}/${opts.maxPollAttempts})`);
+      await opts.sleepFn(opts.pollDelayMs);
+      continue;
+    }
+
+    const requiredStablePolls = isCollectingSupported
+      ? opts.stablePollsRequired
+      : opts.stablePollsRequired + 1;
+
+    if (signature === lastSignature) {
+      stableCount++;
+    } else {
+      lastSignature = signature;
+      stableCount = 1;
+    }
+
+    if (stableCount >= requiredStablePolls) {
+      return { resolved: true, packageLinks, packageByUuid };
+    }
+
+    console.log(
+      `  ⏳ Waiting for links to stabilize (${packageLinks.length} found, stable ${stableCount}/${requiredStablePolls})`,
+    );
+    await opts.sleepFn(opts.pollDelayMs);
+  }
+
+  return { resolved: false, packageLinks: lastLinks, packageByUuid: lastPackageByUuid };
 }
 
 /**
  * Push scraper: sends `matched` records to JDownloader and transitions them to `pushed`.
  *
- * For series with episode tracking, it:
- * 1. Pushes the crypted container (all episodes) to the linkgrabber WITHOUT autostart
- * 2. Waits for JDownloader to resolve the container into individual links
- * 3. Removes links that don't match the target episode pattern
- * 4. Moves only the target episode's links to the download list
+ * For series season packs that only need newly released episodes (fromEpisode > 1), it:
+ * 1. Snapshots existing linkgrabber UUIDs
+ * 2. Pushes the crypted container to the linkgrabber WITHOUT autostart
+ * 3. Waits until JDownloader finishes collecting (`!isCollecting`) AND resolved links stabilize
+ * 4. Removes links that don't match ANY target episode in the new episode range
+ * 5. Moves ALL parts of the target episode(s) to the download list
  */
 export async function runPushScraper(
   jdownloader: JDownloaderClient,
   nocodb: NocoDbClient,
   config: Config,
+  options: PushOptions = {},
 ): Promise<void> {
+  const opts: Required<PushOptions> = {
+    pollDelayMs: options.pollDelayMs ?? DEFAULT_POLL_DELAY_MS,
+    maxPollAttempts: options.maxPollAttempts ?? DEFAULT_POLL_MAX_ATTEMPTS,
+    stablePollsRequired: options.stablePollsRequired ?? DEFAULT_STABLE_POLLS_REQUIRED,
+    sleepFn: options.sleepFn ?? sleep,
+  };
+
   console.log('▶ Push scraper starting...');
 
   const matched = await nocodb.getMatchesByStatus('matched');
@@ -128,11 +357,15 @@ export async function runPushScraper(
 
     const packageName = match.Fulltitle || match.Title;
     const metadataPath = buildMetadataPath(match);
-    const needsFiltering = isSeriesRecheck(match);
+    const filterRange = getEpisodeFilterRange(match);
 
     try {
-      if (needsFiltering) {
-        // Series with episode info: push without autostart, then filter to target episode
+      if (filterRange) {
+        // Snapshot existing links so we only inspect/modify links from this container push
+        const existingLinks = await jdownloader.queryLinks();
+        const existingLinkUuids = new Set(existingLinks.map(l => l.uuid));
+
+        // Season pack with specific new episode(s): push without autostart, wait for full resolution, then filter
         await jdownloader.pushLinks({
           links: [selected.url],
           packageName,
@@ -140,63 +373,53 @@ export async function runPushScraper(
           destinationFolder: metadataPath,
         });
 
-        console.log(`  📦 Container sent, waiting for link resolution...`);
-        await sleep(LINKGRABBER_RESOLVE_DELAY_MS);
+        const rangeLabel = formatSeasonEpisodeKey(
+          filterRange.season,
+          filterRange.fromEpisode,
+          filterRange.toEpisode,
+        );
+        console.log(`  📦 Container sent for ${rangeLabel}, waiting for full link resolution...`);
 
-        // Poll linkgrabber for resolved links matching this package
-        const episodePattern = buildEpisodePattern(match.Season, match.Episode!);
-        // Build a prefix to identify links from this release (e.g., "From.S04" from "From.S04.GERMAN.DL...")
-        const releasePrefix = packageName.split('.').slice(0, 2).join('.').toLowerCase();
-        let resolved = false;
+        const { resolved, packageLinks, packageByUuid } = await waitForResolvedLinks(
+          jdownloader,
+          existingLinkUuids,
+          metadataPath,
+          packageName,
+          opts,
+        );
 
-        for (let attempt = 0; attempt < LINKGRABBER_POLL_MAX_ATTEMPTS; attempt++) {
-          const links = await jdownloader.queryLinks();
-          // Find links belonging to this release by filename prefix
-          const packageLinks = links.filter(l =>
-            l.name.toLowerCase().startsWith(releasePrefix)
+        if (resolved) {
+          const episodePattern = buildEpisodesPattern(filterRange.season, filterRange.episodes);
+          const { keepLinks, removeLinkIds } = partitionLinksByEpisodes(
+            packageLinks,
+            packageByUuid,
+            episodePattern,
           );
 
-          if (packageLinks.length === 0) {
-            console.log(`  ⏳ No links resolved yet (attempt ${attempt + 1}/${LINKGRABBER_POLL_MAX_ATTEMPTS})`);
-            await sleep(LINKGRABBER_RESOLVE_DELAY_MS);
-            continue;
-          }
-
-          // Filter: keep only links matching the target episode
-          const keepLinks = packageLinks.filter(l => episodePattern.test(l.name));
-          const removeLinksIds = packageLinks
-            .filter(l => !episodePattern.test(l.name))
-            .map(l => l.uuid);
-
           if (keepLinks.length === 0) {
-            console.log(`  ⚠ No links match episode pattern ${episodePattern} — keeping all`);
-            // Move all to download list if we can't filter
+            console.log(`  ⚠ No links match episode pattern ${episodePattern} — keeping all ${packageLinks.length} link(s)`);
             if (config.JDOWNLOADER_AUTOSTART) {
               await jdownloader.moveToDownloadList(packageLinks.map(l => l.uuid));
             }
           } else {
-            // Remove old episode links, keep only the target episode
-            if (removeLinksIds.length > 0) {
-              await jdownloader.removeLinks(removeLinksIds);
-              console.log(`  🗑️ Removed ${removeLinksIds.length} links (old episodes)`);
+            if (removeLinkIds.length > 0) {
+              await jdownloader.removeLinks(removeLinkIds);
+              console.log(`  🗑️ Removed ${removeLinkIds.length} link(s) (old episodes)`);
             }
-            // Move target episode links to download list
             if (config.JDOWNLOADER_AUTOSTART) {
               await jdownloader.moveToDownloadList(keepLinks.map(l => l.uuid));
             }
-            console.log(`  ✅ Pushed: "${packageName}" E${String(match.Episode).padStart(2, '0')} (${keepLinks.length} file(s), filtered from ${packageLinks.length})`);
+            console.log(
+              `  ✅ Pushed: "${packageName}" ${rangeLabel} (${keepLinks.length} file(s), filtered from ${packageLinks.length})`,
+            );
           }
-
-          resolved = true;
-          break;
-        }
-
-        if (!resolved) {
-          console.log(`  ⚠ Link resolution timed out for "${packageName}" — container left in linkgrabber`);
-          // Still mark as pushed — the container is in the linkgrabber for manual handling
+        } else {
+          console.log(
+            `  ⚠ Link resolution timed out for "${packageName}" (${packageLinks.length} link(s) seen) — container left in linkgrabber`,
+          );
         }
       } else {
-        // Movies or first-time series: push with autostart as before
+        // Movies, individual episode uploads, or first-time season packs (starting at E01): push directly
         await jdownloader.pushLinks({
           links: [selected.url],
           packageName,
@@ -210,13 +433,12 @@ export async function runPushScraper(
         Status: 'pushed',
       });
       pushed++;
-
     } catch (err) {
       failed++;
       console.warn(`  ⚠ Push failed for "${packageName}":`, err instanceof Error ? err.message : err);
     }
 
-    await sleep(config.SEARCH_DELAY_MS);
+    await opts.sleepFn(config.SEARCH_DELAY_MS);
   }
 
   console.log(`✔ Push done. Pushed: ${pushed}, Skipped: ${skipped}, Failed: ${failed}`);

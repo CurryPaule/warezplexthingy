@@ -55,19 +55,26 @@ export class NocoDbClient {
     return { Id: record.id, ...record.fields };
   }
 
-  // ─── Watchlist ───────────────────────────────────────────────────────────────
-
-  async getActiveWatchlist(): Promise<(WatchlistRow & { Id: number })[]> {
-    const results: (WatchlistRow & { Id: number })[] = [];
-    let url: string | null = `${this.tablePath(this.watchlistTableId)}/records?where=(Active,eq,1)&limit=100`;
+  /** Fetch all pages of a NocoDB v3 list query */
+  private async paginate<T>(initialUrl: string): Promise<(T & { Id: number })[]> {
+    const results: (T & { Id: number })[] = [];
+    let url: string | null = initialUrl;
 
     while (url) {
-      const data: NocoDbV3ListResponse<WatchlistRow> = await this.request('GET', url);
-      results.push(...data.records.map((r: NocoDbV3Record<WatchlistRow>) => this.flatten(r)));
+      const data: NocoDbV3ListResponse<T> = await this.request('GET', url);
+      results.push(...data.records.map(r => this.flatten(r)));
       url = data.next ?? null;
     }
 
     return results;
+  }
+
+  // ─── Watchlist ───────────────────────────────────────────────────────────────
+
+  async getActiveWatchlist(): Promise<(WatchlistRow & { Id: number })[]> {
+    return this.paginate<WatchlistRow>(
+      `${this.tablePath(this.watchlistTableId)}/records?where=(Active,eq,1)&limit=100`,
+    );
   }
 
   async getWatchlistItemById(id: number): Promise<(WatchlistRow & { Id: number }) | null> {
@@ -86,16 +93,9 @@ export class NocoDbClient {
    * Get all matches with a given status.
    */
   async getMatchesByStatus(status: MatchRow['Status']): Promise<(MatchRow & { Id: number })[]> {
-    const results: (MatchRow & { Id: number })[] = [];
-    let url: string | null = `${this.tablePath(this.matchesTableId)}/records?where=(Status,eq,${status})&limit=100`;
-
-    while (url) {
-      const data: NocoDbV3ListResponse<MatchRow> = await this.request('GET', url);
-      results.push(...data.records.map((r: NocoDbV3Record<MatchRow>) => this.flatten(r)));
-      url = data.next ?? null;
-    }
-
-    return results;
+    return this.paginate<MatchRow>(
+      `${this.tablePath(this.matchesTableId)}/records?where=(Status,eq,${status})&limit=100`,
+    );
   }
 
   /**
@@ -103,17 +103,10 @@ export class NocoDbClient {
    * Includes matched, pushed, and processed statuses — new episodes can appear at any stage.
    */
   async getSeriesMatchesForRecheck(): Promise<(MatchRow & { Id: number })[]> {
-    const results: (MatchRow & { Id: number })[] = [];
     const where = '(Type,eq,series)~and((Status,eq,matched)~or(Status,eq,pushed)~or(Status,eq,processed))';
-    let url: string | null = `${this.tablePath(this.matchesTableId)}/records?where=${where}&limit=100`;
-
-    while (url) {
-      const data: NocoDbV3ListResponse<MatchRow> = await this.request('GET', url);
-      results.push(...data.records.map((r: NocoDbV3Record<MatchRow>) => this.flatten(r)));
-      url = data.next ?? null;
-    }
-
-    return results;
+    return this.paginate<MatchRow>(
+      `${this.tablePath(this.matchesTableId)}/records?where=${where}&limit=100`,
+    );
   }
 
   /**
@@ -121,19 +114,14 @@ export class NocoDbClient {
    * Used by the search scraper to skip items that don't need re-searching.
    */
   async getWatchlistIdsWithActiveMatches(): Promise<Set<number>> {
-    const ids = new Set<number>();
     const where = '(Status,eq,found)~or(Status,eq,matched)';
-    let url: string | null = `${this.tablePath(this.matchesTableId)}/records?where=${where}&limit=100`;
-
-    while (url) {
-      const data: NocoDbV3ListResponse<MatchRow> = await this.request('GET', url);
-      for (const record of data.records) {
-        const wid = record.fields.WatchlistId;
-        if (wid) ids.add(wid);
-      }
-      url = data.next ?? null;
+    const matches = await this.paginate<MatchRow>(
+      `${this.tablePath(this.matchesTableId)}/records?where=${where}&limit=100`,
+    );
+    const ids = new Set<number>();
+    for (const match of matches) {
+      if (match.WatchlistId) ids.add(match.WatchlistId);
     }
-
     return ids;
   }
 

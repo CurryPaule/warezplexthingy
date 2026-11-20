@@ -7,6 +7,7 @@ import {
   normalizeTitle,
   meetsLanguage,
 } from '../matcher';
+import { sleep } from '../utils';
 
 /**
  * Build the search query for a watchlist item.
@@ -20,10 +21,6 @@ function buildSearchQuery(item: WatchlistRow): string {
     return `${item.Title} S${s}`;
   }
   return item.Title;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 /**

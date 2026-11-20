@@ -82,37 +82,51 @@ export class FileBrowserClient {
     return this.token!;
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const token = await this.ensureToken();
-    const url = `${this.baseUrl}/api/resources${path}`;
+  private normalizePath(rawPath: string): string {
+    return rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+  }
 
-    const response = await fetch(url, {
-      method,
+  private encodePath(normalizedPath: string): string {
+    return normalizedPath
+      .split('/')
+      .map(segment => encodeURIComponent(segment))
+      .join('/');
+  }
+
+  /**
+   * Perform an authenticated fetch with automatic 401 re-login retry once.
+   */
+  private async fetchWithAuth(url: string, init: RequestInit): Promise<Response> {
+    const token = await this.ensureToken();
+    const headers = {
+      ...(init.headers as Record<string, string> | undefined),
+      'X-Auth': token,
+    };
+
+    const response = await fetch(url, { ...init, headers });
+    if (response.status !== 401) {
+      return response;
+    }
+
+    // Token expired — re-login and retry once
+    await this.login();
+    return fetch(url, {
+      ...init,
       headers: {
-        'X-Auth': token,
-        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+        ...(init.headers as Record<string, string> | undefined),
+        'X-Auth': this.token!,
       },
+    });
+  }
+
+  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const url = `${this.baseUrl}/api/resources${this.encodePath(path)}`;
+
+    const response = await this.fetchWithAuth(url, {
+      method,
+      headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
-
-    if (response.status === 401) {
-      // Token expired — re-login and retry once
-      await this.login();
-      const retryResponse = await fetch(url, {
-        method,
-        headers: {
-          'X-Auth': this.token!,
-          ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-        },
-        body: body !== undefined ? JSON.stringify(body) : undefined,
-      });
-      if (!retryResponse.ok) {
-        const text = await retryResponse.text();
-        throw new Error(`FileBrowser ${method} ${path} → ${retryResponse.status}: ${text}`);
-      }
-      const text = await retryResponse.text();
-      return text ? JSON.parse(text) : ({} as T);
-    }
 
     if (!response.ok) {
       const text = await response.text();
@@ -125,14 +139,14 @@ export class FileBrowserClient {
 
   /** List contents of a directory */
   async listDir(dirPath: string): Promise<FileBrowserItem[]> {
-    const normalized = dirPath.startsWith('/') ? dirPath : `/${dirPath}`;
+    const normalized = this.normalizePath(dirPath);
     const data = await this.request<FileBrowserListResponse>('GET', normalized);
     return data.items ?? [];
   }
 
   /** Check if a path exists */
   async exists(filePath: string): Promise<boolean> {
-    const normalized = filePath.startsWith('/') ? filePath : `/${filePath}`;
+    const normalized = this.normalizePath(filePath);
     try {
       await this.request<unknown>('GET', normalized);
       return true;
@@ -143,15 +157,11 @@ export class FileBrowserClient {
 
   /** Create a directory (recursively creates parents) */
   async createDir(dirPath: string): Promise<void> {
-    const normalized = dirPath.startsWith('/') ? dirPath : `/${dirPath}`;
+    const normalized = this.normalizePath(dirPath);
     // FileBrowser creates directories when posting to a path ending with /
-    const token = await this.ensureToken();
-    const url = `${this.baseUrl}/api/resources${normalized}/`;
+    const url = `${this.baseUrl}/api/resources${this.encodePath(normalized)}/`;
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'X-Auth': token },
-    });
+    const response = await this.fetchWithAuth(url, { method: 'POST' });
 
     // 409 = already exists, which is fine
     if (!response.ok && response.status !== 409) {
@@ -162,19 +172,13 @@ export class FileBrowserClient {
 
   /** Move/rename a file or directory */
   async move(sourcePath: string, destPath: string): Promise<void> {
-    const normalized = sourcePath.startsWith('/') ? sourcePath : `/${sourcePath}`;
-    const normalizedDest = destPath.startsWith('/') ? destPath : `/${destPath}`;
-    const token = await this.ensureToken();
+    const normalized = this.normalizePath(sourcePath);
+    const normalizedDest = this.normalizePath(destPath);
 
     // FileBrowser uses PATCH with action and destination as query parameters
     const encodedDest = encodeURIComponent(normalizedDest);
-    const url = `${this.baseUrl}/api/resources${encodeURI(normalized)}?action=rename&destination=${encodedDest}`;
-    const response = await fetch(url, {
-      method: 'PATCH',
-      headers: {
-        'X-Auth': token,
-      },
-    });
+    const url = `${this.baseUrl}/api/resources${this.encodePath(normalized)}?action=rename&destination=${encodedDest}`;
+    const response = await this.fetchWithAuth(url, { method: 'PATCH' });
 
     if (!response.ok) {
       const text = await response.text();
@@ -184,7 +188,7 @@ export class FileBrowserClient {
 
   /** Delete a file or directory */
   async delete(filePath: string): Promise<void> {
-    const normalized = filePath.startsWith('/') ? filePath : `/${filePath}`;
+    const normalized = this.normalizePath(filePath);
     await this.request<unknown>('DELETE', normalized);
   }
 

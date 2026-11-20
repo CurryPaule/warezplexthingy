@@ -16,6 +16,13 @@ export interface CrawledLink {
   size: number;
 }
 
+export interface CrawledPackage {
+  uuid: number;
+  name: string;
+  saveTo: string;
+  childCount: number;
+}
+
 /**
  * Wrapper around the myjdownloader library.
  * Handles connect/disconnect lifecycle and device resolution by name.
@@ -83,6 +90,38 @@ export class JDownloaderClient {
       autostart: options.autostart,
       ...(options.destinationFolder ? { destinationFolder: options.destinationFolder } : {}),
     });
+  }
+
+  /**
+   * Check whether JDownloader's linkgrabber is currently crawling/collecting links.
+   */
+  async isCollecting(): Promise<boolean> {
+    const result = await (this.client as any).callAction(
+      '/linkgrabberv2/isCollecting',
+      this.deviceId,
+      [],
+    );
+    if (typeof result === 'boolean') return result;
+    return Boolean((result as any)?.data);
+  }
+
+  /**
+   * Query all packages currently in the linkgrabber.
+   */
+  async queryPackages(): Promise<CrawledPackage[]> {
+    const result = await this.client.linkgrabberV2.queryPackages(this.deviceId, {
+      name: true,
+      saveTo: true,
+      childCount: true,
+      uuid: true,
+    });
+    const items: any[] = Array.isArray(result) ? result : ((result as any)?.data ?? []);
+    return items.map((pkg: any) => ({
+      uuid: pkg.uuid,
+      name: pkg.name ?? '',
+      saveTo: pkg.saveTo ?? '',
+      childCount: pkg.childCount ?? 0,
+    }));
   }
 
   /**
