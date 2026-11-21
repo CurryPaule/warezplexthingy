@@ -87,6 +87,79 @@ export function selectCryptedLink(
 }
 
 /**
+ * Select direct hoster links from a match record based on hoster priority.
+ * Links is a JSON-serialized Record<string, string[]> (hoster → array of direct part URLs).
+ */
+export function selectDirectLinks(
+  linksJson: string | undefined,
+  hosterPriority: string[],
+): { urls: string[]; hoster: string } | null {
+  if (!linksJson) return null;
+
+  let links: Record<string, unknown>;
+  try {
+    links = JSON.parse(linksJson);
+  } catch {
+    return null;
+  }
+
+  if (!links || typeof links !== 'object' || Object.keys(links).length === 0) return null;
+
+  const extractValidUrls = (val: unknown): string[] => {
+    if (!Array.isArray(val)) return [];
+    return val.filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
+  };
+
+  // Try hosters in priority order
+  for (const hoster of hosterPriority) {
+    const normalized = hoster.trim().toLowerCase();
+    const matchingKey = Object.keys(links).find(k => k.toLowerCase().includes(normalized));
+    if (matchingKey) {
+      const urls = extractValidUrls(links[matchingKey]);
+      if (urls.length > 0) return { urls, hoster: matchingKey };
+    }
+  }
+
+  // Fallback: use first available hoster with valid URLs
+  for (const [hoster, val] of Object.entries(links)) {
+    const urls = extractValidUrls(val);
+    if (urls.length > 0) return { urls, hoster };
+  }
+
+  return null;
+}
+
+/**
+ * Select download links to push to JDownloader:
+ * - For movies and individual episode releases: prefer direct hoster URLs from `Links`
+ *   (avoids container redirectors like filecrypt.cc that may trigger Cloudflare blocks),
+ *   falling back to `CryptedLinks` when direct links are unavailable.
+ * - For series season packs: always prefer `CryptedLinks`, because warez.cx's direct `Links`
+ *   array only contains Episode 1's parts while the container holds the full season.
+ */
+export function selectPushLinks(
+  match: Pick<MatchRow, 'Type' | 'Fulltitle' | 'Links' | 'CryptedLinks'>,
+  hosterPriority: string[],
+): { urls: string[]; hoster: string; source: 'direct' | 'crypted' } | null {
+  const isSeasonPack = match.Type === 'series'
+    && Boolean(match.Fulltitle)
+    && isSeasonPackFulltitle(match.Fulltitle);
+
+  if (!isSeasonPack) {
+    const direct = selectDirectLinks(match.Links, hosterPriority);
+    if (direct) return { ...direct, source: 'direct' };
+  }
+
+  const crypted = selectCryptedLink(match.CryptedLinks, hosterPriority);
+  if (crypted) return { urls: [crypted.url], hoster: crypted.hoster, source: 'crypted' };
+
+  const fallbackDirect = selectDirectLinks(match.Links, hosterPriority);
+  if (fallbackDirect) return { ...fallbackDirect, source: 'direct' };
+
+  return null;
+}
+
+/**
  * Determine whether a match requires linkgrabber episode filtering and return the target range.
  *
  * Filtering is ONLY needed when:
@@ -347,10 +420,10 @@ export async function runPushScraper(
   let failed = 0;
 
   for (const match of matched) {
-    const selected = selectCryptedLink(match.CryptedLinks, hosterPriority);
+    const selected = selectPushLinks(match, hosterPriority);
 
     if (!selected) {
-      console.log(`  ⚠ No crypted links found for "${match.Fulltitle}" — skipping`);
+      console.log(`  ⚠ No downloadable links found for "${match.Fulltitle}" — skipping`);
       skipped++;
       continue;
     }
@@ -367,7 +440,7 @@ export async function runPushScraper(
 
         // Season pack with specific new episode(s): push without autostart, wait for full resolution, then filter
         await jdownloader.pushLinks({
-          links: [selected.url],
+          links: selected.urls,
           packageName,
           autostart: false,
           destinationFolder: metadataPath,
@@ -429,12 +502,15 @@ export async function runPushScraper(
       } else {
         // Movies, individual episode uploads, or first-time season packs (starting at E01): push directly
         await jdownloader.pushLinks({
-          links: [selected.url],
+          links: selected.urls,
           packageName,
           autostart: config.JDOWNLOADER_AUTOSTART,
           destinationFolder: metadataPath,
         });
-        console.log(`  ✅ Pushed: "${packageName}" (via ${selected.hoster})`);
+        const viaLabel = selected.source === 'direct'
+          ? `${selected.urls.length} direct link(s) via ${selected.hoster}`
+          : `container via ${selected.hoster}`;
+        console.log(`  ✅ Pushed: "${packageName}" (${viaLabel})`);
       }
 
       await nocodb.updateMatchRelease(match.Id, {

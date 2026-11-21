@@ -14,6 +14,15 @@ import {
   formatSeasonEpisodeKey,
   parseEpisodeRange,
 } from '../matcher';
+import {
+  extractReleaseProfile,
+  formatAutoTags,
+  hasManualTags,
+  hasRelaxableAutoTags,
+  isReleaseOlderThanGracePeriod,
+  matchesAutoTags,
+  sortReleasesByPreference,
+} from '../release-profile';
 import { sleep } from '../utils';
 
 /** Timeout in ms for each hoster online-check request */
@@ -22,6 +31,8 @@ const ONLINE_CHECK_TIMEOUT_MS = 5000;
 export interface EnrichOptions {
   sleepFn?: (ms: number) => Promise<void>;
   isHosterOnlineFn?: (stateUrl: string) => Promise<boolean>;
+  /** Override current time (for deterministic grace-period testing) */
+  now?: Date;
 }
 
 interface OnlineRelease {
@@ -35,9 +46,58 @@ interface MatchEntry {
   isRecheck: boolean;
 }
 
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
 /**
- * Check if a single hoster's links are online by fetching the hide.cx state SVG.
- * Returns true (online) only when the response contains stroke="green".
+ * Inspect an indexed-color PNG's `PLTE` palette chunk (used by filecrypt.cc status icons)
+ * to determine if the badge is solid green (online) rather than red/yellow (offline/partial).
+ */
+export function isPngPaletteGreen(buf: Buffer): boolean {
+  if (buf.length < 24 || !buf.subarray(0, 8).equals(PNG_SIGNATURE)) {
+    return false;
+  }
+
+  let offset = 8;
+  while (offset + 12 <= buf.length) {
+    const length = buf.readUInt32BE(offset);
+    const type = buf.subarray(offset + 4, offset + 8).toString('ascii');
+    const dataStart = offset + 8;
+    const dataEnd = dataStart + length;
+    if (dataEnd + 4 > buf.length) break;
+
+    if (type === 'PLTE') {
+      let greenCount = 0;
+      let nonGreenSignalCount = 0;
+
+      for (let i = dataStart; i + 2 < dataEnd; i += 3) {
+        const r = buf[i]!;
+        const g = buf[i + 1]!;
+        const b = buf[i + 2]!;
+
+        if (g >= 120 && g > r + 40 && g > b + 40) {
+          greenCount++;
+        } else if (
+          (r >= 120 && r > g + 40) || // red
+          (r >= 150 && g >= 100 && b < 80 && r >= g) // yellow / orange (partial)
+        ) {
+          nonGreenSignalCount++;
+        }
+      }
+
+      return greenCount > 0 && nonGreenSignalCount === 0;
+    }
+
+    if (type === 'IEND') break;
+    offset = dataEnd + 4; // skip 4-byte CRC
+  }
+
+  return false;
+}
+
+/**
+ * Check if a single hoster's links are online by fetching its status badge:
+ * - `hide.cx/state/...` returns an SVG containing `stroke="green"` when online.
+ * - `filecrypt.cc/Stat/...png` returns an indexed-color PNG with a green `PLTE` palette when online.
  * Any error, timeout, or unparsable response is treated as offline.
  */
 export async function isHosterOnline(stateUrl: string): Promise<boolean> {
@@ -47,8 +107,11 @@ export async function isHosterOnline(stateUrl: string): Promise<boolean> {
     const response = await fetch(stateUrl, { signal: controller.signal });
     clearTimeout(timer);
     if (!response.ok) return false;
-    const body = await response.text();
-    return body.includes('stroke="green"');
+    const buf = Buffer.from(await response.arrayBuffer());
+    if (buf.length >= 8 && buf.subarray(0, 8).equals(PNG_SIGNATURE)) {
+      return isPngPaletteGreen(buf);
+    }
+    return buf.toString('utf8').includes('stroke="green"');
   } catch {
     return false;
   }
@@ -117,6 +180,25 @@ async function findFirstOnlineRelease(
 }
 
 /**
+ * Check if a detail release matches a watchlist item's base filters (Quality, Language, Season)
+ * without applying manual Tags or AutoTags.
+ */
+function releaseMatchesBaseFilters(
+  release: WarezDetailRelease,
+  watchlistItem: WatchlistRow,
+): boolean {
+  if (!matchesQuality(release.quality, watchlistItem.Quality)) return false;
+  if (!meetsLanguage(release.lang, watchlistItem.LangRequired, release.fulltitle)) return false;
+
+  if (watchlistItem.Type === 'series' && watchlistItem.Season != null) {
+    const releaseSeason = extractSeason(release.fulltitle);
+    if (releaseSeason !== null && releaseSeason !== watchlistItem.Season) return false;
+  }
+
+  return true;
+}
+
+/**
  * Check if a detail release matches a watchlist item's filters.
  * Applies Quality, Tags, Language, and Season checks.
  */
@@ -124,15 +206,8 @@ export function releaseMatchesFilters(
   release: WarezDetailRelease,
   watchlistItem: WatchlistRow,
 ): boolean {
-  if (!matchesQuality(release.quality, watchlistItem.Quality)) return false;
-  if (!meetsLanguage(release.lang, watchlistItem.LangRequired, release.fulltitle)) return false;
+  if (!releaseMatchesBaseFilters(release, watchlistItem)) return false;
   if (!matchesTags(release.fulltitle, watchlistItem.Tags)) return false;
-
-  if (watchlistItem.Type === 'series' && watchlistItem.Season != null) {
-    const releaseSeason = extractSeason(release.fulltitle);
-    if (releaseSeason !== null && releaseSeason !== watchlistItem.Season) return false;
-  }
-
   return true;
 }
 
@@ -209,9 +284,13 @@ async function processMovieMatch(
   releases: WarezDetailRelease[],
   watchlistItem: WatchlistRow & { Id: number },
   nocodb: NocoDbClient,
+  config: Config,
   checkOnline: (stateUrl: string) => Promise<boolean>,
 ): Promise<'enriched' | 'skipped'> {
-  const candidateReleases = releases.filter(r => releaseMatchesFilters(r, watchlistItem));
+  const candidateReleases = sortReleasesByPreference(
+    releases.filter(r => releaseMatchesFilters(r, watchlistItem)),
+    config.PREFERRED_GROUPS,
+  );
 
   if (candidateReleases.length === 0) {
     const filters = [
@@ -243,75 +322,68 @@ async function processMovieMatch(
   return 'enriched';
 }
 
+interface SeriesAttemptResult {
+  enriched: number;
+  updated: number;
+  hadAnyNewCandidates: boolean;
+  matchedRelease?: WarezDetailRelease;
+}
+
 /**
- * Process all matches for one series + season bucket against available releases.
+ * Attempt to match season packs or individual episodes from `candidateReleases`
+ * for one series + season bucket.
  *
- * Handles both:
- * 1. Season packs (`episode_count_in_season`): computes the full newly released episode range
- *    (e.g. `S02E05-E07` when episodes 5..7 dropped since last check at E04), and preserves any
- *    unpushed range start if the match is still in `matched` status.
- * 2. Individual episode uploads (`S02E05`, `S02E06`, `S02E07`): matches ALL episodes higher than
- *    `lastEp` (in ascending order) rather than stopping at the first/highest one.
+ * Candidates are ranked using `sortReleasesByPreference` (HDR → 265 → 264 → fallback).
+ * If `pinAutoTagsOnMatch` is true, once the first release matches, its profile is pinned
+ * into `AutoTags` (and immediately enforced on remaining episodes in the same batch).
  */
-async function processSeriesBucket(
-  entries: MatchEntry[],
+async function attemptSeriesMatch(
+  candidateReleases: WarezDetailRelease[],
+  foundEntries: MatchEntry[],
+  recheckEntries: MatchEntry[],
   bucketSeason: number | null,
-  releases: WarezDetailRelease[],
+  lastEp: number,
   watchlistItem: WatchlistRow & { Id: number },
   nocodb: NocoDbClient,
+  config: Config,
   checkOnline: (stateUrl: string) => Promise<boolean>,
-): Promise<{ enriched: number; updated: number; skipped: number }> {
-  const foundEntries = entries.filter(e => !e.isRecheck);
-  const recheckEntries = entries.filter(e => e.isRecheck);
+  pinAutoTagsMode: 'none' | 'initial' | 'fallback',
+): Promise<SeriesAttemptResult> {
   const hasRecheck = recheckEntries.length > 0;
   const baseMatch = (foundEntries[0] ?? recheckEntries[0])!.match;
 
-  // Filter releases by watchlist filters and (during re-check) keep within the same season
-  const candidateReleases = releases.filter(r => {
-    if (!releaseMatchesFilters(r, watchlistItem)) return false;
-    if (hasRecheck && bucketSeason != null) {
-      const relSeason = extractSeason(r.fulltitle);
-      if (relSeason !== null && relSeason !== bucketSeason) return false;
+  const pinProfile = async (release: WarezDetailRelease): Promise<string | undefined> => {
+    if (pinAutoTagsMode === 'none') return undefined;
+    const newAutoTags = formatAutoTags(extractReleaseProfile(release));
+    if (!newAutoTags) return undefined;
+
+    if (pinAutoTagsMode === 'fallback') {
+      const prev = watchlistItem.AutoTags ?? '';
+      if (newAutoTags !== prev) {
+        await nocodb.updateWatchlistAutoTags(watchlistItem.Id, newAutoTags);
+        watchlistItem.AutoTags = newAutoTags;
+        console.log(`  🔄 AutoTags fallback: [${watchlistItem.Title}] "${prev}" → "${newAutoTags}"`);
+      }
+    } else if (!watchlistItem.AutoTags?.trim()) {
+      await nocodb.updateWatchlistAutoTags(watchlistItem.Id, newAutoTags);
+      watchlistItem.AutoTags = newAutoTags;
+      console.log(`  📌 Pinned AutoTags: [${watchlistItem.Title}] → "${newAutoTags}"`);
     }
-    return true;
-  });
+    return newAutoTags;
+  };
 
-  if (candidateReleases.length === 0) {
-    if (!hasRecheck) {
-      const filters = [
-        watchlistItem.Quality ? `Q:${watchlistItem.Quality}` : null,
-        watchlistItem.Tags ? `Tags:${watchlistItem.Tags}` : null,
-        watchlistItem.LangRequired ? `Lang:${watchlistItem.LangRequired}` : null,
-      ].filter(Boolean).join(', ');
-      console.log(`  ⏳ No matching release for "${baseMatch.Title}" (filters: ${filters || 'none'})`);
-    }
-    return { enriched: 0, updated: 0, skipped: 1 };
-  }
-
-  // Highest episode already tracked for this bucket.
-  // On re-check, use the minimum of match.Episode and watchlist.LastEpisodeFound (when set)
-  // so manually lowering LastEpisodeFound in the Watchlist table triggers a re-download,
-  // while multi-season shows with a lower match.Episode still track their own season accurately.
-  const maxMatchEp = hasRecheck
-    ? Math.max(...recheckEntries.map(e => e.match.Episode ?? 0))
-    : 0;
-  const lastEp = hasRecheck
-    ? (watchlistItem.LastEpisodeFound != null
-      ? Math.min(maxMatchEp, watchlistItem.LastEpisodeFound)
-      : maxMatchEp)
-    : (watchlistItem.LastEpisodeFound ?? 0);
-
-  // Split into season packs vs individual episodes
-  const seasonPackCandidates = candidateReleases
-    .filter(r => isSeasonPackFulltitle(r.fulltitle))
-    .filter(r => {
-      const count = getEpisodeCount(r);
-      if (count != null) return count > lastEp;
-      // Season pack without episode_count_in_season: only eligible on initial enrichment with no prior eps
-      return !hasRecheck && lastEp === 0;
-    })
-    // Prefer the season pack with the highest episode count
-    .sort((a, b) => (getEpisodeCount(b) ?? 0) - (getEpisodeCount(a) ?? 0));
+  // Split into season packs vs individual episodes, ranked by preference ladder
+  const seasonPackCandidates = sortReleasesByPreference(
+    candidateReleases
+      .filter(r => isSeasonPackFulltitle(r.fulltitle))
+      .filter(r => {
+        const count = getEpisodeCount(r);
+        if (count != null) return count > lastEp;
+        // Season pack without episode_count_in_season: only eligible on initial enrichment with no prior eps
+        return !hasRecheck && lastEp === 0;
+      }),
+    config.PREFERRED_GROUPS,
+  );
 
   // ── 1. Try season packs first ────────────────────────────────────────────────
   if (seasonPackCandidates.length > 0) {
@@ -369,13 +441,14 @@ async function processSeriesBucket(
         await nocodb.updateWatchlistEpisode(watchlistItem.Id, episode);
         watchlistItem.LastEpisodeFound = episode;
       }
+      await pinProfile(online.release);
 
       if (foundEntries.length > 0) {
         console.log(`  ✅ Enriched: [${watchlistItem.Title}] ← "${online.release.fulltitle}" (${seasonEpisodeKey ?? 'pack'})`);
-        return { enriched: 1, updated: 0, skipped: 0 };
+        return { enriched: 1, updated: 0, hadAnyNewCandidates: true, matchedRelease: online.release };
       } else {
         console.log(`  🆕 New episodes: [${watchlistItem.Title}] — ${seasonEpisodeKey ?? 'pack'} (was E${String(lastEp).padStart(2, '0')})`);
-        return { enriched: 0, updated: 1, skipped: 0 };
+        return { enriched: 0, updated: 1, hadAnyNewCandidates: true, matchedRelease: online.release };
       }
     }
   }
@@ -397,10 +470,23 @@ async function processSeriesBucket(
     let updated = 0;
     let highestMatched = lastEp;
     let consumedFound = false;
+    let firstMatchedRelease: WarezDetailRelease | undefined;
+    let sessionPinnedAutoTags: string | undefined;
 
     for (const epNum of sortedEpNumbers) {
-      const mirrors = episodesMap.get(epNum)!;
-      const online = await findFirstOnlineRelease(mirrors, checkOnline);
+      let mirrors = episodesMap.get(epNum)!;
+      // Once the first episode in this batch pins AutoTags, keep remaining episodes in the batch consistent
+      if (sessionPinnedAutoTags) {
+        const pinnedMirrors = mirrors.filter(r => matchesAutoTags(r, sessionPinnedAutoTags, 'strict'));
+        if (pinnedMirrors.length > 0) {
+          mirrors = pinnedMirrors;
+        } else {
+          continue;
+        }
+      }
+
+      const sortedMirrors = sortReleasesByPreference(mirrors, config.PREFERRED_GROUPS);
+      const online = await findFirstOnlineRelease(sortedMirrors, checkOnline);
       if (!online) continue;
 
       const season = extractSeason(online.release.fulltitle) ?? bucketSeason ?? undefined;
@@ -428,6 +514,11 @@ async function processSeriesBucket(
         }
       }
 
+      if (!firstMatchedRelease) {
+        firstMatchedRelease = online.release;
+        sessionPinnedAutoTags = await pinProfile(online.release);
+      }
+
       if (epNum > highestMatched) highestMatched = epNum;
     }
 
@@ -437,14 +528,139 @@ async function processSeriesBucket(
         await nocodb.updateWatchlistEpisode(watchlistItem.Id, highestMatched);
         watchlistItem.LastEpisodeFound = highestMatched;
       }
-      return { enriched, updated, skipped: 0 };
+      return { enriched, updated, hadAnyNewCandidates: true, matchedRelease: firstMatchedRelease };
+    }
+  }
+
+  return {
+    enriched: 0,
+    updated: 0,
+    hadAnyNewCandidates: seasonPackCandidates.length > 0 || sortedEpNumbers.length > 0,
+  };
+}
+
+/**
+ * Process all matches for one series + season bucket against available releases.
+ *
+ * Handles:
+ * 1. Manual `Tags` (highest priority — overrides and never touches `AutoTags`).
+ * 2. Pinned `AutoTags` (strict match first; if nothing new is found and `AUTOTAGS_FALLBACK_HOURS`
+ *    has elapsed on a matching DynamicRange+Codec release from another group, falls back and updates `AutoTags`).
+ * 3. Initial match without `Tags`/`AutoTags`: ranks via preference ladder (HDR → 265 → 264 → fallback)
+ *    and pins the matched release profile into `AutoTags`.
+ */
+async function processSeriesBucket(
+  entries: MatchEntry[],
+  bucketSeason: number | null,
+  releases: WarezDetailRelease[],
+  watchlistItem: WatchlistRow & { Id: number },
+  nocodb: NocoDbClient,
+  config: Config,
+  checkOnline: (stateUrl: string) => Promise<boolean>,
+  now: Date,
+): Promise<{ enriched: number; updated: number; skipped: number }> {
+  const foundEntries = entries.filter(e => !e.isRecheck);
+  const recheckEntries = entries.filter(e => e.isRecheck);
+  const hasRecheck = recheckEntries.length > 0;
+  const baseMatch = (foundEntries[0] ?? recheckEntries[0])!.match;
+
+  // Base filters: Quality, LangRequired, and Season
+  const baseReleases = releases.filter(r => {
+    if (!releaseMatchesBaseFilters(r, watchlistItem)) return false;
+    if (hasRecheck && bucketSeason != null) {
+      const relSeason = extractSeason(r.fulltitle);
+      if (relSeason !== null && relSeason !== bucketSeason) return false;
+    }
+    return true;
+  });
+
+  // Highest episode already tracked for this bucket.
+  // On re-check, use the minimum of match.Episode and watchlist.LastEpisodeFound (when set)
+  // so manually lowering LastEpisodeFound in the Watchlist table triggers a re-download,
+  // while multi-season shows with a lower match.Episode still track their own season accurately.
+  const maxMatchEp = hasRecheck
+    ? Math.max(...recheckEntries.map(e => e.match.Episode ?? 0))
+    : 0;
+  const lastEp = hasRecheck
+    ? (watchlistItem.LastEpisodeFound != null
+      ? Math.min(maxMatchEp, watchlistItem.LastEpisodeFound)
+      : maxMatchEp)
+    : (watchlistItem.LastEpisodeFound ?? 0);
+
+  const manualTagsActive = hasManualTags(watchlistItem.Tags);
+  const autoTagsValue = !manualTagsActive ? watchlistItem.AutoTags?.trim() : undefined;
+
+  let primaryCandidates: WarezDetailRelease[];
+  let pinMode: 'none' | 'initial' | 'fallback';
+
+  if (manualTagsActive) {
+    primaryCandidates = baseReleases.filter(r => matchesTags(r.fulltitle, watchlistItem.Tags));
+    pinMode = 'none';
+  } else if (autoTagsValue) {
+    primaryCandidates = baseReleases.filter(r => matchesAutoTags(r, autoTagsValue, 'strict'));
+    pinMode = 'none';
+  } else {
+    primaryCandidates = baseReleases;
+    pinMode = 'initial';
+  }
+
+  let primaryAttempt: SeriesAttemptResult = { enriched: 0, updated: 0, hadAnyNewCandidates: false };
+
+  if (primaryCandidates.length > 0) {
+    primaryAttempt = await attemptSeriesMatch(
+      primaryCandidates,
+      foundEntries,
+      recheckEntries,
+      bucketSeason,
+      lastEp,
+      watchlistItem,
+      nocodb,
+      config,
+      checkOnline,
+      pinMode,
+    );
+    if (primaryAttempt.enriched > 0 || primaryAttempt.updated > 0) {
+      return { enriched: primaryAttempt.enriched, updated: primaryAttempt.updated, skipped: 0 };
+    }
+  }
+
+  // Pass 2: Grace-period fallback when AutoTags is active and strict group/source match yielded nothing new
+  if (autoTagsValue && hasRelaxableAutoTags(autoTagsValue)) {
+    const fallbackHours = config.AUTOTAGS_FALLBACK_HOURS ?? 48;
+    const fallbackCandidates = baseReleases.filter(
+      r => matchesAutoTags(r, autoTagsValue, 'relaxed') && isReleaseOlderThanGracePeriod(r, now, fallbackHours),
+    );
+
+    if (fallbackCandidates.length > 0) {
+      const fallbackAttempt = await attemptSeriesMatch(
+        fallbackCandidates,
+        foundEntries,
+        recheckEntries,
+        bucketSeason,
+        lastEp,
+        watchlistItem,
+        nocodb,
+        config,
+        checkOnline,
+        'fallback',
+      );
+      if (fallbackAttempt.enriched > 0 || fallbackAttempt.updated > 0) {
+        return { enriched: fallbackAttempt.enriched, updated: fallbackAttempt.updated, skipped: 0 };
+      }
     }
   }
 
   // Nothing new or all matching candidates offline
   if (!hasRecheck) {
-    const hadAnyNewCandidates = seasonPackCandidates.length > 0 || sortedEpNumbers.length > 0;
-    if (hadAnyNewCandidates) {
+    if (primaryCandidates.length === 0) {
+      const filters = [
+        watchlistItem.Quality ? `Q:${watchlistItem.Quality}` : null,
+        manualTagsActive ? `Tags:${watchlistItem.Tags}` : null,
+        autoTagsValue ? `AutoTags:${autoTagsValue}` : null,
+        watchlistItem.LangRequired ? `Lang:${watchlistItem.LangRequired}` : null,
+      ].filter(Boolean).join(', ');
+      console.log(`  ⏳ No matching release for "${baseMatch.Title}" (filters: ${filters || 'none'})`);
+    } else if (primaryAttempt.hadAnyNewCandidates) {
       console.log(`  ⛔ All matching release(s) for "${baseMatch.Title}" are offline`);
     } else {
       console.log(`  ⏩ No new episodes for "${baseMatch.Title}" (last found: E${String(lastEp).padStart(2, '0')})`);
@@ -467,6 +683,7 @@ export async function runEnrichScraper(
 ): Promise<void> {
   const sleepFn = options.sleepFn ?? sleep;
   const checkOnline = options.isHosterOnlineFn ?? isHosterOnline;
+  const now = options.now ?? new Date();
 
   console.log('▶ Enrichment scraper starting...');
 
@@ -488,15 +705,7 @@ export async function runEnrichScraper(
     return;
   }
 
-  // Group by WarezUid to avoid duplicate API calls
-  const byUid = new Map<string, MatchEntry[]>();
-  for (const entry of allMatches) {
-    const uid = entry.match.WarezUid;
-    if (!byUid.has(uid)) byUid.set(uid, []);
-    byUid.get(uid)!.push(entry);
-  }
-
-  // Pre-load watchlist items
+  // Pre-load watchlist items and filter out entries belonging to inactive/missing watchlist items
   const watchlistCache = new Map<number, WatchlistRow & { Id: number }>();
   for (const entry of allMatches) {
     const wid = entry.match.WatchlistId;
@@ -509,6 +718,25 @@ export async function runEnrichScraper(
   let enriched = 0;
   let updated = 0;
   let skipped = 0;
+
+  // Group active entries by WarezUid to avoid duplicate or wasted API calls
+  const byUid = new Map<string, MatchEntry[]>();
+  for (const entry of allMatches) {
+    const wid = entry.match.WatchlistId;
+    const watchlistItem = wid ? watchlistCache.get(wid) : undefined;
+    if (!watchlistItem || !watchlistItem.Active) {
+      skipped++;
+      continue;
+    }
+    const uid = entry.match.WarezUid;
+    if (!byUid.has(uid)) byUid.set(uid, []);
+    byUid.get(uid)!.push(entry);
+  }
+
+  if (byUid.size === 0) {
+    console.log(`✔ Enrichment done. Enriched: 0, Updated: 0, Skipped: ${skipped} (all watchlist items inactive)`);
+    return;
+  }
 
   for (const [uid, entries] of byUid) {
     const label = entries[0]!.isRecheck ? '🔄' : '📦';
@@ -546,7 +774,7 @@ export async function runEnrichScraper(
 
       if (watchlistItem.Type !== 'series') {
         for (const { match } of watchlistEntries) {
-          const result = await processMovieMatch(match, releases, watchlistItem, nocodb, checkOnline);
+          const result = await processMovieMatch(match, releases, watchlistItem, nocodb, config, checkOnline);
           if (result === 'enriched') {
             enriched++;
             console.log(`  ✅ Enriched: [${watchlistItem.Title}] ← "${match.Title}"`);
@@ -573,7 +801,9 @@ export async function runEnrichScraper(
           releases,
           watchlistItem,
           nocodb,
+          config,
           checkOnline,
+          now,
         );
         enriched += res.enriched;
         updated += res.updated;

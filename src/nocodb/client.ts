@@ -77,6 +77,12 @@ export class NocoDbClient {
     );
   }
 
+  async getAllWatchlist(): Promise<(WatchlistRow & { Id: number })[]> {
+    return this.paginate<WatchlistRow>(
+      `${this.tablePath(this.watchlistTableId)}/records?limit=100`,
+    );
+  }
+
   async getWatchlistItemById(id: number): Promise<(WatchlistRow & { Id: number }) | null> {
     const url = `${this.tablePath(this.watchlistTableId)}/records/${id}`;
     try {
@@ -85,6 +91,17 @@ export class NocoDbClient {
     } catch {
       return null;
     }
+  }
+
+  async createWatchlistItem(item: Omit<WatchlistRow, 'Id'>): Promise<WatchlistRow & { Id: number }> {
+    const url = `${this.tablePath(this.watchlistTableId)}/records`;
+    const record = await this.request<NocoDbV3Record<WatchlistRow>>('POST', url, { fields: item });
+    return this.flatten(record);
+  }
+
+  async updateWatchlistItem(id: number, fields: Partial<WatchlistRow>): Promise<void> {
+    const url = `${this.tablePath(this.watchlistTableId)}/records`;
+    await this.request('PATCH', url, { id, fields });
   }
 
   // ─── Matches ─────────────────────────────────────────────────────────────────
@@ -224,6 +241,11 @@ export class NocoDbClient {
   async updateWatchlistEpisode(id: number, episode: number): Promise<void> {
     const url = `${this.tablePath(this.watchlistTableId)}/records`;
     await this.request('PATCH', url, { id, fields: { LastEpisodeFound: episode } });
+  }
+
+  /** Update the auto-pinned release profile (AutoTags) for a series watchlist item */
+  async updateWatchlistAutoTags(id: number, autoTags: string): Promise<void> {
+    await this.updateWatchlistItem(id, { AutoTags: autoTags });
   }
 
   /** Deactivate a watchlist item (e.g. after DeactivateOnMatch) */

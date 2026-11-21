@@ -6,6 +6,8 @@ import {
   partitionLinksByEpisodes,
   runPushScraper,
   selectCryptedLink,
+  selectDirectLinks,
+  selectPushLinks,
 } from '../src/scrapers/push';
 import type { Config } from '../src/config';
 import type { CrawledLink, CrawledPackage, JDownloaderClient } from '../src/jdownloader/client';
@@ -62,6 +64,69 @@ describe('push helper functions', () => {
     expect(selectCryptedLink(json, ['ddownload', 'rapidgator'])).toEqual({
       url: 'https://hide.cx/ddl',
       hoster: 'ddownload',
+    });
+  });
+
+  it('prefers direct Links for movies and individual episodes, but uses CryptedLinks for series season packs', () => {
+    const directJson = JSON.stringify({
+      'rapidgator.net': ['https://rapidgator.net/file/1', 'https://rapidgator.net/file/2'],
+      'ddownload.com': ['https://ddownload.com/part1', 'https://ddownload.com/part2'],
+    });
+    const cryptedJson = JSON.stringify({
+      'ddownload.com': 'https://filecrypt.cc/Container/ABC.html',
+    });
+
+    expect(selectDirectLinks(directJson, ['ddownload', 'rapidgator'])).toEqual({
+      urls: ['https://ddownload.com/part1', 'https://ddownload.com/part2'],
+      hoster: 'ddownload.com',
+    });
+
+    // Movie → prefers direct Links (avoids filecrypt.cc Cloudflare container)
+    expect(
+      selectPushLinks(
+        makeMatch({ Type: 'movie', Fulltitle: 'Ronin.1998.1080p.BluRay.x265-VECTOR', Links: directJson, CryptedLinks: cryptedJson }),
+        ['ddownload', 'rapidgator'],
+      ),
+    ).toEqual({
+      urls: ['https://ddownload.com/part1', 'https://ddownload.com/part2'],
+      hoster: 'ddownload.com',
+      source: 'direct',
+    });
+
+    // Individual episode → prefers direct Links
+    expect(
+      selectPushLinks(
+        makeMatch({ Type: 'series', Fulltitle: 'Show.S02E05.1080p.WEB.H265-WAYNE', Links: directJson, CryptedLinks: cryptedJson }),
+        ['ddownload', 'rapidgator'],
+      ),
+    ).toEqual({
+      urls: ['https://ddownload.com/part1', 'https://ddownload.com/part2'],
+      hoster: 'ddownload.com',
+      source: 'direct',
+    });
+
+    // Series season pack → MUST use CryptedLinks (direct Links only has Episode 1)
+    expect(
+      selectPushLinks(
+        makeMatch({ Type: 'series', Fulltitle: 'Show.S02.1080p.WEB.H265-WAYNE', Links: directJson, CryptedLinks: cryptedJson }),
+        ['ddownload', 'rapidgator'],
+      ),
+    ).toEqual({
+      urls: ['https://filecrypt.cc/Container/ABC.html'],
+      hoster: 'ddownload.com',
+      source: 'crypted',
+    });
+
+    // Movie without direct Links → falls back to CryptedLinks
+    expect(
+      selectPushLinks(
+        makeMatch({ Type: 'movie', Fulltitle: 'Ronin.1998.1080p', Links: '{}', CryptedLinks: cryptedJson }),
+        ['ddownload', 'rapidgator'],
+      ),
+    ).toEqual({
+      urls: ['https://filecrypt.cc/Container/ABC.html'],
+      hoster: 'ddownload.com',
+      source: 'crypted',
     });
   });
 

@@ -8,11 +8,13 @@ A Fastify REST API server exposes all scraper modes as HTTP endpoints:
 
 | Endpoint | What it does |
 |---|---|
+| `POST /api/ombi-sync` | Syncs approved Ombi movie & TV requests into the NocoDB `watchlist` (with release-date gating) |
+| `POST /api/ombi-webhook` | Ombi Webhook notification target — triggers immediate `ombi-sync` + `search → enrich → push` when a request is approved |
 | `POST /api/search` | Queries the warez search API for each watchlist item to find media entries |
-| `POST /api/enrich` | Fetches full release detail, applies filters, re-checks series for new episodes |
+| `POST /api/enrich` | Fetches full release detail, applies filters, re-checks active series for new episodes |
 | `POST /api/push` | Sends matched downloads to JDownloader (filters episodes for series re-checks) |
 | `POST /api/sort` | Sorts completed downloads into Plex/Jellyfin directory structure via FileBrowser |
-| `POST /api/workflow` | Runs the full pipeline: search → enrich → push |
+| `POST /api/workflow` | Runs the full pipeline: ombi-sync (if configured) → search → enrich → push |
 | `GET /api/health` | Health check |
 
 ### Match Status Flow
@@ -109,7 +111,8 @@ Create three tables in NocoDB manually:
 | `TmdbId` | Number | Optional |
 | `Quality` | Single Select | `720p`, `1080p`, `2160p` (leave blank for any) |
 | `LangRequired` | Text | Comma-separated e.g. `GER,ENG` |
-| `Tags` | Multi Select | AND filter against fulltitle (e.g. `HDR`, `WEB`, `H265`, uploader name) |
+| `Tags` | Multi Select | Manual override — AND filter against fulltitle (e.g. `HDR`, `WEB`, `H265`, uploader name). Overrides `AutoTags` when set |
+| `AutoTags` | Single Line Text | Auto-populated for series on first match when `Tags` is empty (e.g. `HDR,265,AMZN,WAYNE` or `SDR,264,SAUERKRAUT`) to keep episode quality/source consistent |
 | `Season` | Number | Series season number (blank = any) |
 | `LastEpisodeFound` | Number | Auto-updated — highest episode count matched so far |
 | `Active` | Checkbox | Uncheck to pause monitoring |
@@ -165,6 +168,18 @@ Key variables:
 | `NOCODB_MATCHES_TABLE_ID` | Same for matches table |
 | `NOCODB_STATE_TABLE_ID` | Same for state table |
 | `SEARCH_DELAY_MS` | Delay between API queries in ms (default 1500) |
+| `DEFAULT_QUALITY` | Default quality for Ombi-synced watchlist items: `720p`, `1080p`, `2160p`, or `any` (default: `1080p`; 4K Ombi requests automatically use `2160p`) |
+| `DEFAULT_LANG` | Default `LangRequired` for Ombi-synced watchlist items (default: `GER`) |
+| `DEFAULT_TAGS` | Default `Tags` (comma-separated) for Ombi-synced watchlist items (default: empty) |
+| `PREFERRED_GROUPS` | Preferred release groups in priority order (comma-separated, e.g. `VECTOR,WAYNE,ZeroTwo,WAREZCX,SAUERKRAUT`) |
+| `AUTOTAGS_FALLBACK_HOURS` | Hours to wait for a series's pinned release group/source (`AutoTags`) before falling back to same `HDR/SDR + codec` (default: `48`) |
+| `OMBI_URL` | Ombi base URL, e.g. `http://localhost:3579` (optional — enables Ombi sync) |
+| `OMBI_API_KEY` | Ombi API key from Settings → Configuration → General (optional — enables Ombi sync) |
+| `OMBI_MOVIE_DIGITAL_LOOKAHEAD_DAYS` | Days before a movie's `digitalReleaseDate` to enable scanning (default: `7`) |
+| `OMBI_SERIES_AIRDATE_LOOKAHEAD_DAYS` | Days before a season's first episode `airDate` to enable scanning (default: `1`) |
+| `OMBI_PLEX_SYNC_DELAY_MS` | Delay in ms after `/api/sort` before triggering Ombi's Plex Recently Added sync (default: `15000`) |
+| `OMBI_WEBHOOK_SECRET` | Optional shared secret for `POST /api/ombi-webhook` (pass via `?token=...`, `ApplicationToken`, or `X-Webhook-Secret`) |
+| `OMBI_WEBHOOK_DEBOUNCE_MS` | Delay in ms to coalesce rapid Ombi webhook events into one background run (default: `3000`) |
 | `JDOWNLOADER_EMAIL` | MyJDownloader account email (required for `push` mode) |
 | `JDOWNLOADER_PASSWORD` | MyJDownloader account password (required for `push` mode) |
 | `JDOWNLOADER_DEVICE_NAME` | JDownloader device name (required for `push` mode) |
@@ -216,6 +231,7 @@ npm start
 curl.exe -X POST http://localhost:3000/api/workflow
 
 # Individual steps
+curl.exe -X POST http://localhost:3000/api/ombi-sync
 curl.exe -X POST http://localhost:3000/api/search
 curl.exe -X POST http://localhost:3000/api/enrich
 curl.exe -X POST http://localhost:3000/api/push
@@ -235,6 +251,7 @@ npm run test:warez -- --search "Breaking Bad" # Test search with a query
 npm run test:nocodb                           # Test NocoDB connection
 npm run test:match                            # Dry-run matcher against live data
 npm run test:jdownloader                      # Test MyJDownloader connectivity
+npm run test:ombi                             # Dry-run Ombi connectivity & request mapping
 ```
 
 ## Docker
@@ -289,8 +306,10 @@ If NocoDB runs in Docker too, uncomment the `networks` section in `docker/docker
 2. **Normalized title** — lowercased, dots/dashes stripped, then compared. The release's `title` field (provided by warez, clean) and an extracted version of `fulltitle` are both checked.
 3. **Quality filter** — tiers: `720p`, `1080p`, `2160p`. Set `Quality` to match only that exact quality tier.
 4. **Language filter** — `LangRequired = GER,ENG` means the release must include both German and English audio.
-5. **Tags filter** — all tags must appear in the release fulltitle (AND logic, case-insensitive). Use for format filters (`HDR`, `WEB`, `H265`) or to pin a specific uploader for consistent quality.
-6. **Season filter** — for series, set `Season = 2` to only match season 2 releases.
+5. **Tags filter** — all manual `Tags` must appear in the release fulltitle (AND logic, case-insensitive). When set, manual `Tags` completely override `AutoTags`.
+6. **Release preference ladder** — when multiple releases match (or no `Tags` are set), candidates are ranked down `HDR` → `265/HEVC` → `264/AVC` → fallback (tie-breaking by `DL` dual-language, `265` inside `HDR`, `PREFERRED_GROUPS` order, `BluRay` over `WEB`, episode count, and popularity), walking down the ladder automatically if higher-tier hosters are offline.
+7. **Series `AutoTags` pinning** — when a series without manual `Tags` matches its first release, its profile (`HDR/SDR`, codec, streaming source, release group) is saved to `AutoTags` so subsequent episodes stay consistent (`SDR` explicitly rejects `HDR/DV`). If the pinned group/source stops uploading, after `AUTOTAGS_FALLBACK_HOURS` (default `48h`) it falls back to another group with the same `HDR/SDR + codec` and updates `AutoTags`.
+8. **Season filter** — for series, set `Season = 2` to only match season 2 releases.
 
 ### Episode Tracking
 

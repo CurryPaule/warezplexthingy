@@ -15,6 +15,22 @@ const envBoolean = z.preprocess((val) => {
   return val;
 }, z.boolean());
 
+const emptyToUndefined = z.preprocess((val) => {
+  if (typeof val === 'string' && val.trim() === '') return undefined;
+  return val;
+}, z.string().optional());
+
+const defaultQuality = z.preprocess((val) => {
+  if (val === undefined || val === null) return '1080p';
+  if (typeof val === 'string') {
+    const trimmed = val.trim();
+    if (trimmed === '') return '1080p';
+    if (trimmed.toLowerCase() === 'any') return '';
+    return trimmed;
+  }
+  return val;
+}, z.enum(['720p', '1080p', '2160p', '']));
+
 const ConfigSchema = z.object({
   NOCODB_URL: z.string().url(),
   NOCODB_API_KEY: z.string().min(1),
@@ -24,16 +40,35 @@ const ConfigSchema = z.object({
   NOCODB_STATE_TABLE_ID: z.string().min(1),
 
   WAREZ_API_BASE: z.string().url().default('https://api.warez.cx'),
-  WAREZ_USER_AGENT: z.string().optional(),
-  WAREZ_COOKIE: z.string().optional(),
+  WAREZ_USER_AGENT: emptyToUndefined,
+  WAREZ_COOKIE: emptyToUndefined,
 
   SEARCH_DELAY_MS: z.coerce.number().int().nonnegative().default(1500),
-  DEFAULT_QUALITY: z.enum(['720p', '1080p', '2160p', '']).default(''),
+  DEFAULT_QUALITY: defaultQuality,
+  DEFAULT_LANG: z.string().default('GER'),
+  DEFAULT_TAGS: z.string().default(''),
+  PREFERRED_GROUPS: z.string().default(''),
+  AUTOTAGS_FALLBACK_HOURS: z.coerce.number().int().nonnegative().default(48),
+
+  // Ombi (optional — enables `ombi-sync` endpoint and workflow step)
+  OMBI_URL: z.preprocess(
+    (val) => (typeof val === 'string' && val.trim() === '' ? undefined : val),
+    z.string().url().optional(),
+  ),
+  OMBI_API_KEY: emptyToUndefined,
+  OMBI_MOVIE_DIGITAL_LOOKAHEAD_DAYS: z.coerce.number().int().nonnegative().default(7),
+  OMBI_SERIES_AIRDATE_LOOKAHEAD_DAYS: z.coerce.number().int().nonnegative().default(1),
+  OMBI_PLEX_SYNC_DELAY_MS: z.coerce.number().int().nonnegative().default(15000),
+  OMBI_WEBHOOK_SECRET: emptyToUndefined,
+  OMBI_WEBHOOK_DEBOUNCE_MS: z.coerce.number().int().nonnegative().default(3000),
 
   // JDownloader (optional — required only for `push` mode)
-  JDOWNLOADER_EMAIL: z.string().email().optional(),
-  JDOWNLOADER_PASSWORD: z.string().min(1).optional(),
-  JDOWNLOADER_DEVICE_NAME: z.string().min(1).optional(),
+  JDOWNLOADER_EMAIL: z.preprocess(
+    (val) => (typeof val === 'string' && val.trim() === '' ? undefined : val),
+    z.string().email().optional(),
+  ),
+  JDOWNLOADER_PASSWORD: emptyToUndefined,
+  JDOWNLOADER_DEVICE_NAME: emptyToUndefined,
   JDOWNLOADER_AUTOSTART: envBoolean.default(false),
   JDOWNLOADER_HOSTER_PRIORITY: z.string().default('ddownload,rapidgator'),
 
@@ -41,12 +76,15 @@ const ConfigSchema = z.object({
   API_PORT: z.coerce.number().int().positive().default(3000),
 
   // FileBrowser (optional — required only for `sort` mode)
-  FILEBROWSER_URL: z.string().url().optional(),
-  FILEBROWSER_USERNAME: z.string().min(1).optional(),
-  FILEBROWSER_PASSWORD: z.string().min(1).optional(),
-  FILEBROWSER_DOWNLOAD_PATH: z.string().min(1).optional(), // e.g. "/downloads"
-  MEDIA_MOVIES_PATH: z.string().min(1).optional(),          // e.g. "/media/movies"
-  MEDIA_SHOWS_PATH: z.string().min(1).optional(),           // e.g. "/media/shows"
+  FILEBROWSER_URL: z.preprocess(
+    (val) => (typeof val === 'string' && val.trim() === '' ? undefined : val),
+    z.string().url().optional(),
+  ),
+  FILEBROWSER_USERNAME: emptyToUndefined,
+  FILEBROWSER_PASSWORD: emptyToUndefined,
+  FILEBROWSER_DOWNLOAD_PATH: emptyToUndefined, // e.g. "/downloads"
+  MEDIA_MOVIES_PATH: emptyToUndefined,         // e.g. "/media/movies"
+  MEDIA_SHOWS_PATH: emptyToUndefined,          // e.g. "/media/shows"
 });
 
 export type Config = z.infer<typeof ConfigSchema>;

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { runEnrichScraper } from '../src/scrapers/enrich';
+import { runEnrichScraper, isPngPaletteGreen } from '../src/scrapers/enrich';
 import type { Config } from '../src/config';
 import type { NocoDbClient } from '../src/nocodb/client';
 import type { MatchRow, WatchlistRow } from '../src/nocodb/types';
@@ -8,6 +8,7 @@ import type { WarezDetailRelease } from '../src/warez/types';
 
 const TEST_CONFIG = {
   SEARCH_DELAY_MS: 0,
+  AUTOTAGS_FALLBACK_HOURS: 48,
 } as Config;
 
 const noopSleep = async () => {};
@@ -100,6 +101,7 @@ function createMocks(params: {
     upsertMatch: vi.fn(async () => true),
     updateWatchlistLastMatched: vi.fn(async () => {}),
     updateWatchlistEpisode: vi.fn(async () => {}),
+    updateWatchlistAutoTags: vi.fn(async () => {}),
     deactivateWatchlistItem: vi.fn(async () => {}),
   };
 
@@ -464,5 +466,324 @@ describe('runEnrichScraper — movies', () => {
       expect.objectContaining({ WarezId: 999, Status: 'matched' }),
     );
     expect(nocodbMocks.deactivateWatchlistItem).toHaveBeenCalledWith(2);
+  });
+});
+
+describe('runEnrichScraper — inactive watchlist gating', () => {
+  it('skips series re-checks and found matches when watchlist item Active is false (without calling warez detail API)', async () => {
+    const { nocodb, nocodbMocks, warez, warezMocks } = createMocks({
+      foundMatches: [
+        makeMatch({ Id: 10, WatchlistId: 1, WarezUid: 'uid-inactive-found', Status: 'found' }),
+      ],
+      recheckSeries: [
+        makeMatch({ Id: 11, WatchlistId: 2, WarezUid: 'uid-inactive-recheck', Status: 'processed', Episode: 4 }),
+      ],
+      watchlist: {
+        1: makeWatchlistItem({ Id: 1, Active: 0 }),
+        2: makeWatchlistItem({ Id: 2, Active: false, LastEpisodeFound: 4 }),
+      },
+      releasesByUid: {
+        'uid-inactive-found': [makeRelease({ options: { episode_count_in_season: '8' } })],
+        'uid-inactive-recheck': [makeRelease({ options: { episode_count_in_season: '8' } })],
+      },
+    });
+
+    await runEnrichScraper(warez, nocodb, TEST_CONFIG, {
+      sleepFn: noopSleep,
+      isHosterOnlineFn: alwaysOnline,
+    });
+
+    expect(warezMocks.fetchEntryDetail).not.toHaveBeenCalled();
+    expect(nocodbMocks.updateMatchRelease).not.toHaveBeenCalled();
+    expect(nocodbMocks.upsertMatch).not.toHaveBeenCalled();
+  });
+});
+
+describe('runEnrichScraper — preference ladder & AutoTags pinning', () => {
+  const NOW = new Date('2026-11-21T12:00:00Z');
+
+  it('picks HDR over 265 over 264 for movies, and falls down the ladder when HDR is offline', async () => {
+    const { nocodb, nocodbMocks, warez } = createMocks({
+      foundMatches: [
+        makeMatch({
+          Id: 30,
+          WatchlistId: 3,
+          WarezUid: 'uid-movie-ladder',
+          Title: 'Crimson Rivers',
+          Fulltitle: 'Crimson Rivers',
+          Type: 'movie',
+          Season: undefined,
+          Episode: undefined,
+          SeasonEpisodeKey: undefined,
+          Status: 'found',
+        }),
+      ],
+      watchlist: {
+        3: makeWatchlistItem({
+          Id: 3,
+          Title: 'Crimson Rivers',
+          Type: 'movie',
+          DeactivateOnMatch: 1,
+          Season: undefined,
+        }),
+      },
+      releasesByUid: {
+        'uid-movie-ladder': [
+          makeRelease({
+            id: 101,
+            type: 'movie',
+            fulltitle: 'Crimson.Rivers.2000.GERMAN.DL.1080p.WEB.H264-GRP1',
+            video_codec: 'H264',
+            options: { check: { ddownload: 'https://hide.cx/state/264-online' } },
+          }),
+          makeRelease({
+            id: 102,
+            type: 'movie',
+            fulltitle: 'Crimson.Rivers.2000.GERMAN.DL.1080p.WEB.H265-GRP2',
+            video_codec: 'H265',
+            options: { check: { ddownload: 'https://hide.cx/state/265-online' } },
+          }),
+          makeRelease({
+            id: 103,
+            type: 'movie',
+            fulltitle: 'Crimson.Rivers.2000.GERMAN.DL.1080p.WEB.H265.HDR-GRP3',
+            video_codec: 'H265',
+            options: { check: { ddownload: 'https://hide.cx/state/hdr-offline' } },
+          }),
+        ],
+      },
+    });
+
+    await runEnrichScraper(warez, nocodb, TEST_CONFIG, {
+      sleepFn: noopSleep,
+      isHosterOnlineFn: async (url) => !url.includes('offline'),
+      now: NOW,
+    });
+
+    // HDR was offline → fell down ladder to 265 (id 102), NOT 264 (id 101)
+    expect(nocodbMocks.updateMatchRelease).toHaveBeenCalledWith(
+      30,
+      expect.objectContaining({ WarezId: 102, Status: 'matched' }),
+    );
+    // Movies never write AutoTags
+    expect(nocodbMocks.updateWatchlistAutoTags).not.toHaveBeenCalled();
+  });
+
+  it('pins AutoTags on initial series match when manual Tags is empty, and ignores AutoTags when manual Tags is set', async () => {
+    const run1 = createMocks({
+      foundMatches: [
+        makeMatch({
+          Id: 40,
+          WatchlistId: 4,
+          WarezUid: 'uid-pin',
+          Status: 'found',
+          Fulltitle: 'Der Herr der Ringe',
+          Season: undefined,
+          Episode: undefined,
+          SeasonEpisodeKey: undefined,
+        }),
+      ],
+      watchlist: { 4: makeWatchlistItem({ Id: 4, LastEpisodeFound: 0 }) },
+      releasesByUid: {
+        'uid-pin': [
+          makeRelease({
+            id: 201,
+            fulltitle: 'Der.Herr.der.Ringe.S02.GERMAN.DL.1080P.WEB.H264-SAUERKRAUT',
+            video_codec: 'H264',
+            group: 'SAUERKRAUT',
+            options: { episode_count_in_season: '4' },
+          }),
+          makeRelease({
+            id: 202,
+            fulltitle: 'Der.Herr.der.Ringe.S02.GERMAN.DL.1080P.AMZN.WEB.H265.HDR-WAYNE',
+            video_codec: 'H265',
+            group: 'WAYNE',
+            options: { episode_count_in_season: '4' },
+          }),
+        ],
+      },
+    });
+
+    await runEnrichScraper(run1.warez, run1.nocodb, TEST_CONFIG, {
+      sleepFn: noopSleep,
+      isHosterOnlineFn: alwaysOnline,
+      now: NOW,
+    });
+
+    expect(run1.nocodbMocks.updateMatchRelease).toHaveBeenCalledWith(
+      40,
+      expect.objectContaining({ WarezId: 202 }),
+    );
+    expect(run1.nocodbMocks.updateWatchlistAutoTags).toHaveBeenCalledWith(4, 'HDR,265,AMZN,WAYNE');
+
+    // Now test manual Tags override: should ignore AutoTags and never write AutoTags
+    const run2 = createMocks({
+      foundMatches: [
+        makeMatch({
+          Id: 41,
+          WatchlistId: 5,
+          WarezUid: 'uid-manual',
+          Status: 'found',
+          Fulltitle: 'Der Herr der Ringe',
+          Season: undefined,
+          Episode: undefined,
+          SeasonEpisodeKey: undefined,
+        }),
+      ],
+      watchlist: {
+        5: makeWatchlistItem({
+          Id: 5,
+          Tags: ['SAUERKRAUT'],
+          AutoTags: 'HDR,265,AMZN,WAYNE',
+          LastEpisodeFound: 0,
+        }),
+      },
+      releasesByUid: {
+        'uid-manual': [
+          makeRelease({
+            id: 201,
+            fulltitle: 'Der.Herr.der.Ringe.S02.GERMAN.DL.1080P.WEB.H264-SAUERKRAUT',
+            video_codec: 'H264',
+            group: 'SAUERKRAUT',
+            options: { episode_count_in_season: '4' },
+          }),
+          makeRelease({
+            id: 202,
+            fulltitle: 'Der.Herr.der.Ringe.S02.GERMAN.DL.1080P.AMZN.WEB.H265.HDR-WAYNE',
+            video_codec: 'H265',
+            group: 'WAYNE',
+            options: { episode_count_in_season: '4' },
+          }),
+        ],
+      },
+    });
+
+    await runEnrichScraper(run2.warez, run2.nocodb, TEST_CONFIG, {
+      sleepFn: noopSleep,
+      isHosterOnlineFn: alwaysOnline,
+      now: NOW,
+    });
+
+    expect(run2.nocodbMocks.updateMatchRelease).toHaveBeenCalledWith(
+      41,
+      expect.objectContaining({ WarezId: 201 }),
+    );
+    expect(run2.nocodbMocks.updateWatchlistAutoTags).not.toHaveBeenCalled();
+  });
+
+  it('waits during 48h grace period for pinned group, then falls back (same HDR/SDR + codec) and updates AutoTags', async () => {
+    const otherGroupReleaseFresh = makeRelease({
+      id: 301,
+      fulltitle: 'Der.Herr.der.Ringe.S02.GERMAN.DL.1080P.NF.WEB.H265.HDR-SAUERKRAUT',
+      video_codec: 'H265',
+      group: 'SAUERKRAUT',
+      episode_updated_at: '2026-11-20T12:00:00Z', // only 24h old (< 48h)
+      options: { episode_count_in_season: '5' },
+    });
+
+    // 1. Within 48h grace period → should NOT fall back yet
+    const runFresh = createMocks({
+      recheckSeries: [makeMatch({ Id: 50, WatchlistId: 6, Status: 'processed', Episode: 4 })],
+      watchlist: {
+        6: makeWatchlistItem({ Id: 6, AutoTags: 'HDR,265,AMZN,WAYNE', LastEpisodeFound: 4 }),
+      },
+      releasesByUid: { 'uid-lotr': [otherGroupReleaseFresh] },
+    });
+
+    await runEnrichScraper(runFresh.warez, runFresh.nocodb, TEST_CONFIG, {
+      sleepFn: noopSleep,
+      isHosterOnlineFn: alwaysOnline,
+      now: NOW,
+    });
+    expect(runFresh.nocodbMocks.updateMatchRelease).not.toHaveBeenCalled();
+    expect(runFresh.nocodbMocks.updateWatchlistAutoTags).not.toHaveBeenCalled();
+
+    // 2. After 48h grace period → falls back to same HDR + 265 from SAUERKRAUT and updates AutoTags!
+    const otherGroupReleaseOld = makeRelease({
+      ...otherGroupReleaseFresh,
+      id: 302,
+      episode_updated_at: '2026-11-19T10:00:00Z', // 50h old (>= 48h)
+    });
+
+    const runExpired = createMocks({
+      recheckSeries: [makeMatch({ Id: 50, WatchlistId: 6, Status: 'processed', Episode: 4 })],
+      watchlist: {
+        6: makeWatchlistItem({ Id: 6, AutoTags: 'HDR,265,AMZN,WAYNE', LastEpisodeFound: 4 }),
+      },
+      releasesByUid: { 'uid-lotr': [otherGroupReleaseOld] },
+    });
+
+    await runEnrichScraper(runExpired.warez, runExpired.nocodb, TEST_CONFIG, {
+      sleepFn: noopSleep,
+      isHosterOnlineFn: alwaysOnline,
+      now: NOW,
+    });
+    expect(runExpired.nocodbMocks.updateMatchRelease).toHaveBeenCalledWith(
+      50,
+      expect.objectContaining({ WarezId: 302, Episode: 5, SeasonEpisodeKey: 'S02E05' }),
+    );
+    expect(runExpired.nocodbMocks.updateWatchlistAutoTags).toHaveBeenCalledWith(6, 'HDR,265,NF,SAUERKRAUT');
+  });
+
+  it('NEVER relaxes DynamicRange (SDR vs HDR) or Codec (265 vs 264) even after 48h grace period', async () => {
+    const oldHdrRelease = makeRelease({
+      id: 401,
+      fulltitle: 'Der.Herr.der.Ringe.S02.GERMAN.DL.1080P.AMZN.WEB.H265.HDR-SAUERKRAUT',
+      video_codec: 'H265',
+      group: 'SAUERKRAUT',
+      episode_updated_at: '2026-11-15T00:00:00Z', // 6 days old
+      options: { episode_count_in_season: '5' },
+    });
+    const old264Release = makeRelease({
+      id: 402,
+      fulltitle: 'Der.Herr.der.Ringe.S02.GERMAN.DL.1080P.AMZN.WEB.H264-SAUERKRAUT',
+      video_codec: 'H264',
+      group: 'SAUERKRAUT',
+      episode_updated_at: '2026-11-15T00:00:00Z', // 6 days old
+      options: { episode_count_in_season: '5' },
+    });
+
+    const { nocodb, nocodbMocks, warez } = createMocks({
+      recheckSeries: [makeMatch({ Id: 60, WatchlistId: 7, Status: 'processed', Episode: 4 })],
+      watchlist: {
+        7: makeWatchlistItem({ Id: 7, AutoTags: 'SDR,265,AMZN,WAYNE', LastEpisodeFound: 4 }),
+      },
+      releasesByUid: { 'uid-lotr': [oldHdrRelease, old264Release] },
+    });
+
+    await runEnrichScraper(warez, nocodb, TEST_CONFIG, {
+      sleepFn: noopSleep,
+      isHosterOnlineFn: alwaysOnline,
+      now: NOW,
+    });
+
+    expect(nocodbMocks.updateMatchRelease).not.toHaveBeenCalled();
+    expect(nocodbMocks.updateWatchlistAutoTags).not.toHaveBeenCalled();
+  });
+});
+
+describe('isPngPaletteGreen (filecrypt.cc status badge)', () => {
+  function buildMinimalIndexedPng(rgbEntries: [number, number, number][]): Buffer {
+    const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const plteData = Buffer.alloc(rgbEntries.length * 3);
+    rgbEntries.forEach(([r, g, b], idx) => {
+      plteData[idx * 3] = r;
+      plteData[idx * 3 + 1] = g;
+      plteData[idx * 3 + 2] = b;
+    });
+    const lenBuf = Buffer.alloc(4);
+    lenBuf.writeUInt32BE(plteData.length, 0);
+    const typeBuf = Buffer.from('PLTE', 'ascii');
+    const crcBuf = Buffer.alloc(4); // dummy CRC
+    return Buffer.concat([sig, lenBuf, typeBuf, plteData, crcBuf]);
+  }
+
+  it('returns true for green online filecrypt PNG palette', () => {
+    expect(isPngPaletteGreen(buildMinimalIndexedPng([[0, 0, 0], [83, 181, 33], [84, 183, 34]]))).toBe(true);
+  });
+
+  it('returns false for red offline or yellow partial filecrypt PNG palette', () => {
+    expect(isPngPaletteGreen(buildMinimalIndexedPng([[0, 0, 0], [175, 29, 26], [198, 45, 39]]))).toBe(false);
+    expect(isPngPaletteGreen(buildMinimalIndexedPng([[0, 0, 0], [220, 170, 30]]))).toBe(false);
   });
 });

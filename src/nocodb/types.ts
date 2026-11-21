@@ -12,7 +12,8 @@ export interface WatchlistRow {
   DeactivateOnMatch: boolean | number;
   Quality?: '720p' | '1080p' | '2160p' | '';
   LangRequired?: string;          // comma-separated, e.g. "GER,ENG"
-  Tags?: string | string[];          // comma-separated or array, e.g. "HDR,H265,iSSEYMiYAKE" — all must match in fulltitle
+  Tags?: string | string[];       // comma-separated or array, e.g. "HDR,H265,iSSEYMiYAKE" — manual override (all must match)
+  AutoTags?: string;              // auto-pinned series release profile, e.g. "HDR,265,AMZN,WAYNE" or "SDR,264,SAUERKRAUT"
   Season?: number;                // null = any season
   LastEpisodeFound?: number;      // highest episode number matched so far
   LastMatchedAt?: string;
