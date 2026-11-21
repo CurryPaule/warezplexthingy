@@ -14,7 +14,7 @@ export interface ReleaseProfile {
 const HDR_PATTERN = /(?:^|[\s._-])(?:HDR(?:10(?:\+|Plus)?)?|DV|DoVi|Dolby[\s._-]?Vision|HLG)(?:$|[\s._-])/i;
 const CODEC_265_PATTERN = /(?:^|[\s._-])(?:[hx]\.?265|HEVC)(?:$|[\s._-])/i;
 const CODEC_264_PATTERN = /(?:^|[\s._-])(?:[hx]\.?264|AVC)(?:$|[\s._-])/i;
-const DL_PATTERN = /(?:^|[\s._-])(?:DL|MULTI)(?:$|[\s._-])/i;
+const DL_PATTERN = /(?:^|[\s._-])(?<!WEB[\s._-])(?:DL|DUAL|MULTI)(?:$|[\s._-])/i;
 
 /** Marker indicating where the release metadata section begins (after the show/movie title) */
 const METADATA_START_PATTERN = /(?:^|[\s._-])(?:S\d{2}(?:E\d{1,3})?|(?:720|1080|2160)p|GERMAN|ENGLISH|DL|MULTI)(?:$|[\s._-])/i;
@@ -34,6 +34,7 @@ const KNOWN_SOURCES: { canonical: string; pattern: RegExp }[] = [
   { canonical: 'CR', pattern: /(?:^|[\s._-])CR(?:$|[\s._-])/i },
   { canonical: 'ARD', pattern: /(?:^|[\s._-])ARD(?:$|[\s._-])/i },
   { canonical: 'ZDF', pattern: /(?:^|[\s._-])ZDF(?:$|[\s._-])/i },
+  { canonical: 'RTLP', pattern: /(?:^|[\s._-])RTLP(?:$|[\s._-])/i },
   { canonical: 'RTL', pattern: /(?:^|[\s._-])RTL(?:$|[\s._-])/i },
   { canonical: 'BluRay', pattern: /(?:^|[\s._-])Blu-?Ray(?:$|[\s._-])/i },
 ];

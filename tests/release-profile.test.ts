@@ -84,6 +84,27 @@ describe('extractReleaseProfile & formatAutoTags', () => {
     expect(profile.isDL).toBe(false);
     expect(formatAutoTags(profile)).toBe('HDR,265,iSSEYMiYAKE');
   });
+
+  it('does not treat WEB-DL as Dual Language, but does recognize DUAL and RTLP', () => {
+    const germanOnlyWebDl = makeRel({
+      fulltitle: 'Show.S01.German.1080p.RTLP.WEB-DL.H264-GLOTZE',
+      video_codec: 'H264',
+      group: 'GLOTZE',
+      lang: ['GER'],
+    });
+    const p1 = extractReleaseProfile(germanOnlyWebDl);
+    expect(p1.isDL).toBe(false);
+    expect(p1.source).toBe('RTLP');
+    expect(formatAutoTags(p1)).toBe('SDR,264,RTLP,GLOTZE');
+
+    const dualWebDl = makeRel({
+      fulltitle: 'Die.purpurnen.Flusse.German.1080p.RTLP.WEB-DL.DUAL.AAC2.0.H.264-GLOTZE',
+      video_codec: 'H264',
+      group: 'GLOTZE',
+      lang: ['GER'],
+    });
+    expect(extractReleaseProfile(dualWebDl).isDL).toBe(true);
+  });
 });
 
 describe('matchesAutoTags', () => {
