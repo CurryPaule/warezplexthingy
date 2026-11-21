@@ -14,6 +14,7 @@ export interface OmbiSyncOptions {
 
 export interface OmbiSyncSummary {
   created: number;
+  createdActive: number;
   activated: number;
   deactivated: number;
   updated: number;
@@ -426,6 +427,7 @@ export async function runOmbiSync(
 
   const summary: OmbiSyncSummary = {
     created: 0,
+    createdActive: 0,
     activated: 0,
     deactivated: 0,
     updated: 0,
@@ -489,6 +491,7 @@ export async function runOmbiSync(
       const created = await nocodb.createWatchlistItem(newRow);
       matchedWatchlistIds.add(created.Id);
       summary.created++;
+      if (newRow.Active) summary.createdActive++;
 
       const statusIcon = newRow.Active ? '✅' : '⏳';
       const statusText = newRow.Active

@@ -9,6 +9,7 @@ A Fastify REST API server exposes all scraper modes as HTTP endpoints:
 | Endpoint | What it does |
 |---|---|
 | `POST /api/ombi-sync` | Syncs approved Ombi movie & TV requests into the NocoDB `watchlist` (with release-date gating) |
+| `POST /api/ombi-webhook` | Ombi Webhook notification target — triggers immediate `ombi-sync` + `search → enrich → push` when a request is approved |
 | `POST /api/search` | Queries the warez search API for each watchlist item to find media entries |
 | `POST /api/enrich` | Fetches full release detail, applies filters, re-checks active series for new episodes |
 | `POST /api/push` | Sends matched downloads to JDownloader (filters episodes for series re-checks) |
@@ -177,6 +178,8 @@ Key variables:
 | `OMBI_MOVIE_DIGITAL_LOOKAHEAD_DAYS` | Days before a movie's `digitalReleaseDate` to enable scanning (default: `7`) |
 | `OMBI_SERIES_AIRDATE_LOOKAHEAD_DAYS` | Days before a season's first episode `airDate` to enable scanning (default: `1`) |
 | `OMBI_PLEX_SYNC_DELAY_MS` | Delay in ms after `/api/sort` before triggering Ombi's Plex Recently Added sync (default: `15000`) |
+| `OMBI_WEBHOOK_SECRET` | Optional shared secret for `POST /api/ombi-webhook` (pass via `?token=...`, `ApplicationToken`, or `X-Webhook-Secret`) |
+| `OMBI_WEBHOOK_DEBOUNCE_MS` | Delay in ms to coalesce rapid Ombi webhook events into one background run (default: `3000`) |
 | `JDOWNLOADER_EMAIL` | MyJDownloader account email (required for `push` mode) |
 | `JDOWNLOADER_PASSWORD` | MyJDownloader account password (required for `push` mode) |
 | `JDOWNLOADER_DEVICE_NAME` | JDownloader device name (required for `push` mode) |
