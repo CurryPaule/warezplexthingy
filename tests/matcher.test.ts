@@ -128,8 +128,11 @@ describe('quality, language, and tags filters', () => {
     expect(matchesQuality('HDTV', 'hdtv')).toBe(true);
   });
 
-  it('matches language via API array or fulltitle fallback', () => {
+  it('matches language via API array (including 2-letter ISO codes like DE/EN/FR) or fulltitle fallback', () => {
     expect(meetsLanguage(['GER', 'ENG'], 'GER,ENG')).toBe(true);
+    expect(meetsLanguage(['DE', 'FR'], 'GER')).toBe(true);
+    expect(meetsLanguage(['DE', 'EN'], 'GER,ENG')).toBe(true);
+    expect(meetsLanguage(['GER'], 'DE')).toBe(true);
     expect(meetsLanguage(null, 'GER,ENG', 'Show.S01.GERMAN.DL.1080p')).toBe(true);
     expect(meetsLanguage(null, 'GER,ENG', 'Show.S01.GERMAN.1080p')).toBe(false);
   });

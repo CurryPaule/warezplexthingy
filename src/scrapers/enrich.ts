@@ -46,9 +46,58 @@ interface MatchEntry {
   isRecheck: boolean;
 }
 
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
 /**
- * Check if a single hoster's links are online by fetching the hide.cx state SVG.
- * Returns true (online) only when the response contains stroke="green".
+ * Inspect an indexed-color PNG's `PLTE` palette chunk (used by filecrypt.cc status icons)
+ * to determine if the badge is solid green (online) rather than red/yellow (offline/partial).
+ */
+export function isPngPaletteGreen(buf: Buffer): boolean {
+  if (buf.length < 24 || !buf.subarray(0, 8).equals(PNG_SIGNATURE)) {
+    return false;
+  }
+
+  let offset = 8;
+  while (offset + 12 <= buf.length) {
+    const length = buf.readUInt32BE(offset);
+    const type = buf.subarray(offset + 4, offset + 8).toString('ascii');
+    const dataStart = offset + 8;
+    const dataEnd = dataStart + length;
+    if (dataEnd + 4 > buf.length) break;
+
+    if (type === 'PLTE') {
+      let greenCount = 0;
+      let nonGreenSignalCount = 0;
+
+      for (let i = dataStart; i + 2 < dataEnd; i += 3) {
+        const r = buf[i]!;
+        const g = buf[i + 1]!;
+        const b = buf[i + 2]!;
+
+        if (g >= 120 && g > r + 40 && g > b + 40) {
+          greenCount++;
+        } else if (
+          (r >= 120 && r > g + 40) || // red
+          (r >= 150 && g >= 100 && b < 80 && r >= g) // yellow / orange (partial)
+        ) {
+          nonGreenSignalCount++;
+        }
+      }
+
+      return greenCount > 0 && nonGreenSignalCount === 0;
+    }
+
+    if (type === 'IEND') break;
+    offset = dataEnd + 4; // skip 4-byte CRC
+  }
+
+  return false;
+}
+
+/**
+ * Check if a single hoster's links are online by fetching its status badge:
+ * - `hide.cx/state/...` returns an SVG containing `stroke="green"` when online.
+ * - `filecrypt.cc/Stat/...png` returns an indexed-color PNG with a green `PLTE` palette when online.
  * Any error, timeout, or unparsable response is treated as offline.
  */
 export async function isHosterOnline(stateUrl: string): Promise<boolean> {
@@ -58,8 +107,11 @@ export async function isHosterOnline(stateUrl: string): Promise<boolean> {
     const response = await fetch(stateUrl, { signal: controller.signal });
     clearTimeout(timer);
     if (!response.ok) return false;
-    const body = await response.text();
-    return body.includes('stroke="green"');
+    const buf = Buffer.from(await response.arrayBuffer());
+    if (buf.length >= 8 && buf.subarray(0, 8).equals(PNG_SIGNATURE)) {
+      return isPngPaletteGreen(buf);
+    }
+    return buf.toString('utf8').includes('stroke="green"');
   } catch {
     return false;
   }
@@ -232,10 +284,12 @@ async function processMovieMatch(
   releases: WarezDetailRelease[],
   watchlistItem: WatchlistRow & { Id: number },
   nocodb: NocoDbClient,
+  config: Config,
   checkOnline: (stateUrl: string) => Promise<boolean>,
 ): Promise<'enriched' | 'skipped'> {
   const candidateReleases = sortReleasesByPreference(
     releases.filter(r => releaseMatchesFilters(r, watchlistItem)),
+    config.PREFERRED_GROUPS,
   );
 
   if (candidateReleases.length === 0) {
@@ -291,6 +345,7 @@ async function attemptSeriesMatch(
   lastEp: number,
   watchlistItem: WatchlistRow & { Id: number },
   nocodb: NocoDbClient,
+  config: Config,
   checkOnline: (stateUrl: string) => Promise<boolean>,
   pinAutoTagsMode: 'none' | 'initial' | 'fallback',
 ): Promise<SeriesAttemptResult> {
@@ -327,6 +382,7 @@ async function attemptSeriesMatch(
         // Season pack without episode_count_in_season: only eligible on initial enrichment with no prior eps
         return !hasRecheck && lastEp === 0;
       }),
+    config.PREFERRED_GROUPS,
   );
 
   // ── 1. Try season packs first ────────────────────────────────────────────────
@@ -429,7 +485,7 @@ async function attemptSeriesMatch(
         }
       }
 
-      const sortedMirrors = sortReleasesByPreference(mirrors);
+      const sortedMirrors = sortReleasesByPreference(mirrors, config.PREFERRED_GROUPS);
       const online = await findFirstOnlineRelease(sortedMirrors, checkOnline);
       if (!online) continue;
 
@@ -559,6 +615,7 @@ async function processSeriesBucket(
       lastEp,
       watchlistItem,
       nocodb,
+      config,
       checkOnline,
       pinMode,
     );
@@ -583,6 +640,7 @@ async function processSeriesBucket(
         lastEp,
         watchlistItem,
         nocodb,
+        config,
         checkOnline,
         'fallback',
       );
@@ -716,7 +774,7 @@ export async function runEnrichScraper(
 
       if (watchlistItem.Type !== 'series') {
         for (const { match } of watchlistEntries) {
-          const result = await processMovieMatch(match, releases, watchlistItem, nocodb, checkOnline);
+          const result = await processMovieMatch(match, releases, watchlistItem, nocodb, config, checkOnline);
           if (result === 'enriched') {
             enriched++;
             console.log(`  ✅ Enriched: [${watchlistItem.Title}] ← "${match.Title}"`);

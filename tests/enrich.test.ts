@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { runEnrichScraper } from '../src/scrapers/enrich';
+import { runEnrichScraper, isPngPaletteGreen } from '../src/scrapers/enrich';
 import type { Config } from '../src/config';
 import type { NocoDbClient } from '../src/nocodb/client';
 import type { MatchRow, WatchlistRow } from '../src/nocodb/types';
@@ -759,5 +759,31 @@ describe('runEnrichScraper — preference ladder & AutoTags pinning', () => {
 
     expect(nocodbMocks.updateMatchRelease).not.toHaveBeenCalled();
     expect(nocodbMocks.updateWatchlistAutoTags).not.toHaveBeenCalled();
+  });
+});
+
+describe('isPngPaletteGreen (filecrypt.cc status badge)', () => {
+  function buildMinimalIndexedPng(rgbEntries: [number, number, number][]): Buffer {
+    const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const plteData = Buffer.alloc(rgbEntries.length * 3);
+    rgbEntries.forEach(([r, g, b], idx) => {
+      plteData[idx * 3] = r;
+      plteData[idx * 3 + 1] = g;
+      plteData[idx * 3 + 2] = b;
+    });
+    const lenBuf = Buffer.alloc(4);
+    lenBuf.writeUInt32BE(plteData.length, 0);
+    const typeBuf = Buffer.from('PLTE', 'ascii');
+    const crcBuf = Buffer.alloc(4); // dummy CRC
+    return Buffer.concat([sig, lenBuf, typeBuf, plteData, crcBuf]);
+  }
+
+  it('returns true for green online filecrypt PNG palette', () => {
+    expect(isPngPaletteGreen(buildMinimalIndexedPng([[0, 0, 0], [83, 181, 33], [84, 183, 34]]))).toBe(true);
+  });
+
+  it('returns false for red offline or yellow partial filecrypt PNG palette', () => {
+    expect(isPngPaletteGreen(buildMinimalIndexedPng([[0, 0, 0], [175, 29, 26], [198, 45, 39]]))).toBe(false);
+    expect(isPngPaletteGreen(buildMinimalIndexedPng([[0, 0, 0], [220, 170, 30]]))).toBe(false);
   });
 });

@@ -47,6 +47,7 @@ const ConfigSchema = z.object({
   DEFAULT_QUALITY: defaultQuality,
   DEFAULT_LANG: z.string().default('GER'),
   DEFAULT_TAGS: z.string().default(''),
+  PREFERRED_GROUPS: z.string().default(''),
   AUTOTAGS_FALLBACK_HOURS: z.coerce.number().int().nonnegative().default(48),
 
   // Ombi (optional — enables `ombi-sync` endpoint and workflow step)

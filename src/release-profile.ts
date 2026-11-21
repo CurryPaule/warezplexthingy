@@ -1,4 +1,5 @@
 import type { WarezDetailRelease } from './warez/types';
+import { normalizeLangCode } from './matcher';
 
 export type DynamicRange = 'HDR' | 'SDR';
 export type VideoCodecTier = '265' | '264';
@@ -109,10 +110,10 @@ export function extractGroup(release: Pick<WarezDetailRelease, 'group' | 'fullti
   return undefined;
 }
 
-/** Check if release is Dual Language (GER + ENG or DL/MULTI tag) */
+/** Check if release is Dual Language (GER + ENG/other or DL/DUAL/MULTI tag) */
 export function isDualLanguage(release: Pick<WarezDetailRelease, 'lang' | 'fulltitle'>): boolean {
-  const langs = (release.lang ?? []).map(l => l.toUpperCase());
-  if (langs.includes('GER') && langs.includes('ENG')) return true;
+  const langs = (release.lang ?? []).map(l => normalizeLangCode(l)).filter(Boolean);
+  if (langs.includes('GER') && langs.length >= 2) return true;
   return DL_PATTERN.test(getMetadataSection(release.fulltitle));
 }
 
@@ -259,24 +260,63 @@ function getEpisodeCountSafe(release: WarezDetailRelease): number {
   return parsed > 0 ? parsed : 0;
 }
 
+/** Parse comma-separated or array preferred release group list into lowercase priority array */
+export function parsePreferredGroups(raw?: string | string[] | null): string[] {
+  if (!raw) return [];
+  const list = Array.isArray(raw) ? raw : raw.split(',');
+  return list.map(g => g.trim().toLowerCase()).filter(Boolean);
+}
+
+/** Rank media source quality: 0 = BluRay (BD), 1 = WEB / WEB-DL, 2 = other (BDRip, HDTV, etc.) */
+export function getMediaSourceRank(
+  release: Pick<WarezDetailRelease, 'video_stream' | 'fulltitle'>,
+): number {
+  const vs = (release.video_stream ?? '').trim().toUpperCase();
+  if (vs === 'BD' || vs === 'BLURAY' || vs === 'BLU-RAY') return 0;
+  if (vs === 'WEB' || vs === 'WEB-DL' || vs === 'WEBRIP') return 1;
+
+  const meta = getMetadataSection(release.fulltitle);
+  if (/(?:^|[\s._-])Blu-?Ray(?:$|[\s._-])/i.test(meta)) return 0;
+  if (/(?:^|[\s._-])WEB(?:[\s._-]?(?:DL|RIP))?(?:$|[\s._-])/i.test(meta)) return 1;
+  return 2;
+}
+
 /**
  * Sort releases by preference ladder (returns a new array):
  * 1. Ladder tier: HDR (0) → 265 (1) → 264 (2) → other (3)
- * 2. Dual Language (DL / GER+ENG) preferred over single-language
+ * 2. Dual Language (DL / multi-lang) preferred over single-language
  * 3. Codec inside HDR: 265 → 264 → other
- * 4. Higher episode_count_in_season (for series season packs)
- * 5. Higher display_priority
- * 6. Higher downloads
+ * 4. Preferred release group order (`PREFERRED_GROUPS`)
+ * 5. Media source quality: BluRay (0) → WEB (1) → other (2)
+ * 6. Higher episode_count_in_season (for series season packs)
+ * 7. Higher display_priority
+ * 8. Higher downloads
  */
-export function sortReleasesByPreference(releases: WarezDetailRelease[]): WarezDetailRelease[] {
+export function sortReleasesByPreference(
+  releases: WarezDetailRelease[],
+  preferredGroups?: string | string[] | null,
+): WarezDetailRelease[] {
+  const groupPriority = parsePreferredGroups(preferredGroups);
+  const groupRankMap = new Map<string, number>();
+  groupPriority.forEach((g, idx) => {
+    if (!groupRankMap.has(g)) groupRankMap.set(g, idx);
+  });
+
   const decorated = releases.map((release, index) => {
     const profile = extractReleaseProfile(release);
+    const groupLower = profile.group?.toLowerCase();
+    const groupRank = groupLower !== undefined && groupRankMap.has(groupLower)
+      ? groupRankMap.get(groupLower)!
+      : Number.POSITIVE_INFINITY;
+
     return {
       release,
       index,
       tier: getPreferenceLadderTier(profile),
       dlScore: profile.isDL ? 0 : 1,
       codecScore: profile.codec === '265' ? 0 : profile.codec === '264' ? 1 : 2,
+      groupRank,
+      sourceRank: getMediaSourceRank(release),
       episodeCount: getEpisodeCountSafe(release),
       displayPriority: release.display_priority ?? 0,
       downloads: release.downloads ?? 0,
@@ -287,6 +327,8 @@ export function sortReleasesByPreference(releases: WarezDetailRelease[]): WarezD
     if (a.tier !== b.tier) return a.tier - b.tier;
     if (a.dlScore !== b.dlScore) return a.dlScore - b.dlScore;
     if (a.codecScore !== b.codecScore) return a.codecScore - b.codecScore;
+    if (a.groupRank !== b.groupRank) return a.groupRank - b.groupRank;
+    if (a.sourceRank !== b.sourceRank) return a.sourceRank - b.sourceRank;
     if (a.episodeCount !== b.episodeCount) return b.episodeCount - a.episodeCount;
     if (a.displayPriority !== b.displayPriority) return b.displayPriority - a.displayPriority;
     if (a.downloads !== b.downloads) return b.downloads - a.downloads;

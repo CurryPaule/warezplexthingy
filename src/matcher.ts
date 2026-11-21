@@ -104,8 +104,59 @@ export function extractLangsFromFulltitle(fulltitle: string): string[] {
 }
 
 /**
+ * Normalize 2-letter ISO-639-1 or variant language codes to canonical 3-letter codes.
+ * warez.cx mixes 3-letter ("GER", "ENG", "FRE") and 2-letter ("DE", "EN", "FR") codes across uploaders.
+ */
+const LANG_ALIASES: Record<string, string> = {
+  DE: 'GER',
+  DEU: 'GER',
+  GERMAN: 'GER',
+  DEUTSCH: 'GER',
+  EN: 'ENG',
+  ENGLISH: 'ENG',
+  FR: 'FRE',
+  FRA: 'FRE',
+  FRENCH: 'FRE',
+  ES: 'SPA',
+  ESP: 'SPA',
+  SPANISH: 'SPA',
+  IT: 'ITA',
+  ITALIAN: 'ITA',
+  NL: 'DUT',
+  NLD: 'DUT',
+  DUTCH: 'DUT',
+  JA: 'JPN',
+  JP: 'JPN',
+  JAPANESE: 'JPN',
+  KO: 'KOR',
+  KR: 'KOR',
+  KOREAN: 'KOR',
+  ZH: 'CHI',
+  CN: 'CHI',
+  CHINESE: 'CHI',
+  RU: 'RUS',
+  RUSSIAN: 'RUS',
+  PT: 'POR',
+  PORTUGUESE: 'POR',
+  TR: 'TUR',
+  TURKISH: 'TUR',
+  AR: 'ARA',
+  ARABIC: 'ARA',
+  HI: 'HIN',
+  HINDI: 'HIN',
+  PL: 'POL',
+  POLISH: 'POL',
+};
+
+export function normalizeLangCode(code: string): string {
+  const upper = code.trim().toUpperCase();
+  return LANG_ALIASES[upper] ?? upper;
+}
+
+/**
  * Check if a release includes all required languages.
- * Falls back to parsing languages from fulltitle when the API lang array is null/empty.
+ * Normalizes 2-letter ISO codes (e.g. "DE" → "GER") and falls back to parsing languages
+ * from fulltitle when the API lang array is null/empty.
  */
 export function meetsLanguage(
   releaseLangs: string[] | null | undefined,
@@ -113,14 +164,17 @@ export function meetsLanguage(
   fulltitle?: string,
 ): boolean {
   if (!langRequired) return true;
-  const required = langRequired.split(',').map(l => l.trim().toUpperCase()).filter(Boolean);
+  const required = langRequired
+    .split(',')
+    .map(l => normalizeLangCode(l))
+    .filter(Boolean);
   if (required.length === 0) return true;
 
-  let available = (releaseLangs ?? []).map(l => l.toUpperCase());
+  let available = (releaseLangs ?? []).map(l => normalizeLangCode(l)).filter(Boolean);
 
   // Fallback: parse language from fulltitle when API lang is missing
   if (available.length === 0 && fulltitle) {
-    available = extractLangsFromFulltitle(fulltitle).map(l => l.toUpperCase());
+    available = extractLangsFromFulltitle(fulltitle).map(l => normalizeLangCode(l));
   }
 
   return required.every(req => available.includes(req));

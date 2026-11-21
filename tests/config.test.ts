@@ -30,6 +30,7 @@ describe('parseConfig', () => {
     expect(cfg.DEFAULT_QUALITY).toBe('1080p');
     expect(cfg.DEFAULT_LANG).toBe('GER');
     expect(cfg.DEFAULT_TAGS).toBe('');
+    expect(cfg.PREFERRED_GROUPS).toBe('');
     expect(cfg.OMBI_MOVIE_DIGITAL_LOOKAHEAD_DAYS).toBe(7);
     expect(cfg.OMBI_SERIES_AIRDATE_LOOKAHEAD_DAYS).toBe(1);
     expect(cfg.AUTOTAGS_FALLBACK_HOURS).toBe(48);

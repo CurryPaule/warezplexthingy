@@ -209,6 +209,44 @@ describe('sortReleasesByPreference', () => {
     const sorted = sortReleasesByPreference([sdr264Ep5, hdr265Ep4]);
     expect(sorted.map(r => r.id)).toEqual([2, 1]);
   });
+
+  it('prefers PREFERRED_GROUPS order and BluRay over WEB within the same tier', () => {
+    const webUnknown = makeRel({
+      id: 1,
+      fulltitle: 'Movie.2024.German.DL.1080p.WEB-DL.x265-RANDOM',
+      video_codec: 'H265',
+      video_stream: 'WEB-DL',
+      group: 'RANDOM',
+    });
+    const blurayUnknown = makeRel({
+      id: 2,
+      fulltitle: 'Movie.2024.German.DL.1080p.BluRay.x265-OTHER',
+      video_codec: 'H265',
+      video_stream: 'BD',
+      group: 'OTHER',
+    });
+    const webWayne = makeRel({
+      id: 3,
+      fulltitle: 'Movie.2024.German.DL.1080p.WEB-DL.x265-WAYNE',
+      video_codec: 'H265',
+      video_stream: 'WEB-DL',
+      group: 'WAYNE',
+    });
+    const blurayVector = makeRel({
+      id: 4,
+      fulltitle: 'Die.purpurnen.Fluesse.2000.4K.REMASTERED.German.EAC3.DL.1080p.BluRay.x265-VECTOR',
+      video_codec: 'MPEG-H H.265 / HEVC',
+      video_stream: 'BD',
+      lang: ['DE', 'FR'],
+      group: 'VECTOR',
+    });
+
+    const sorted = sortReleasesByPreference(
+      [webUnknown, blurayUnknown, webWayne, blurayVector],
+      'VECTOR,WAYNE,ZeroTwo,WAREZCX,SAUERKRAUT',
+    );
+    expect(sorted.map(r => r.id)).toEqual([4, 3, 2, 1]);
+  });
 });
 
 describe('isReleaseOlderThanGracePeriod', () => {
