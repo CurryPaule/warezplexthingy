@@ -24,4 +24,25 @@ describe('parseConfig', () => {
   it('defaults JDOWNLOADER_AUTOSTART to false when omitted', () => {
     expect(parseConfig({ ...BASE_ENV }).JDOWNLOADER_AUTOSTART).toBe(false);
   });
+
+  it('defaults DEFAULT_QUALITY to 1080p, DEFAULT_LANG to GER, and DEFAULT_TAGS to empty', () => {
+    const cfg = parseConfig({ ...BASE_ENV });
+    expect(cfg.DEFAULT_QUALITY).toBe('1080p');
+    expect(cfg.DEFAULT_LANG).toBe('GER');
+    expect(cfg.DEFAULT_TAGS).toBe('');
+    expect(cfg.OMBI_MOVIE_DIGITAL_LOOKAHEAD_DAYS).toBe(7);
+    expect(cfg.OMBI_SERIES_AIRDATE_LOOKAHEAD_DAYS).toBe(1);
+  });
+
+  it('treats empty DEFAULT_QUALITY as 1080p and "any" as empty string', () => {
+    expect(parseConfig({ ...BASE_ENV, DEFAULT_QUALITY: '' }).DEFAULT_QUALITY).toBe('1080p');
+    expect(parseConfig({ ...BASE_ENV, DEFAULT_QUALITY: 'any' }).DEFAULT_QUALITY).toBe('');
+    expect(parseConfig({ ...BASE_ENV, DEFAULT_QUALITY: '2160p' }).DEFAULT_QUALITY).toBe('2160p');
+  });
+
+  it('accepts empty OMBI_URL and OMBI_API_KEY as undefined', () => {
+    const cfg = parseConfig({ ...BASE_ENV, OMBI_URL: '', OMBI_API_KEY: '' });
+    expect(cfg.OMBI_URL).toBeUndefined();
+    expect(cfg.OMBI_API_KEY).toBeUndefined();
+  });
 });

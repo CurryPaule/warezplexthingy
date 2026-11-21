@@ -488,15 +488,7 @@ export async function runEnrichScraper(
     return;
   }
 
-  // Group by WarezUid to avoid duplicate API calls
-  const byUid = new Map<string, MatchEntry[]>();
-  for (const entry of allMatches) {
-    const uid = entry.match.WarezUid;
-    if (!byUid.has(uid)) byUid.set(uid, []);
-    byUid.get(uid)!.push(entry);
-  }
-
-  // Pre-load watchlist items
+  // Pre-load watchlist items and filter out entries belonging to inactive/missing watchlist items
   const watchlistCache = new Map<number, WatchlistRow & { Id: number }>();
   for (const entry of allMatches) {
     const wid = entry.match.WatchlistId;
@@ -509,6 +501,25 @@ export async function runEnrichScraper(
   let enriched = 0;
   let updated = 0;
   let skipped = 0;
+
+  // Group active entries by WarezUid to avoid duplicate or wasted API calls
+  const byUid = new Map<string, MatchEntry[]>();
+  for (const entry of allMatches) {
+    const wid = entry.match.WatchlistId;
+    const watchlistItem = wid ? watchlistCache.get(wid) : undefined;
+    if (!watchlistItem || !watchlistItem.Active) {
+      skipped++;
+      continue;
+    }
+    const uid = entry.match.WarezUid;
+    if (!byUid.has(uid)) byUid.set(uid, []);
+    byUid.get(uid)!.push(entry);
+  }
+
+  if (byUid.size === 0) {
+    console.log(`✔ Enrichment done. Enriched: 0, Updated: 0, Skipped: ${skipped} (all watchlist items inactive)`);
+    return;
+  }
 
   for (const [uid, entries] of byUid) {
     const label = entries[0]!.isRecheck ? '🔄' : '📦';

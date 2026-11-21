@@ -6,6 +6,8 @@ import { NocoDbClient } from './nocodb/client';
 import { WarezClient } from './warez/api';
 import { JDownloaderClient } from './jdownloader/client';
 import { FileBrowserClient } from './filebrowser/client';
+import { OmbiClient } from './ombi/client';
+import { runOmbiSync } from './scrapers/ombi-sync';
 import { runSearchScraper } from './scrapers/search';
 import { runEnrichScraper } from './scrapers/enrich';
 import { runPushScraper } from './scrapers/push';
@@ -34,6 +36,29 @@ export function buildServer(config: Config): FastifyInstance {
 
   app.get('/api/health', async () => {
     return { status: 'ok', timestamp: new Date().toISOString() };
+  });
+
+  // ─── Ombi Sync ───────────────────────────────────────────────────────────────
+
+  app.post('/api/ombi-sync', async (_req: FastifyRequest, reply: FastifyReply) => {
+    if (!config.OMBI_URL || !config.OMBI_API_KEY) {
+      reply.status(500);
+      return {
+        status: 'error',
+        mode: 'ombi-sync',
+        error: 'OMBI_URL and OMBI_API_KEY must be configured',
+      };
+    }
+
+    try {
+      const ombi = new OmbiClient(config);
+      const summary = await runOmbiSync(ombi, nocodb, config);
+      return { status: 'ok', mode: 'ombi-sync', summary };
+    } catch (err) {
+      app.log.error(err, 'Ombi sync failed');
+      reply.status(500);
+      return { status: 'error', mode: 'ombi-sync', error: String(err) };
+    }
   });
 
   // ─── Search ──────────────────────────────────────────────────────────────────
@@ -89,6 +114,20 @@ export function buildServer(config: Config): FastifyInstance {
     let jdownloader: JDownloaderClient | null = null;
 
     try {
+      // Ombi Sync (optional — runs automatically when OMBI_URL & OMBI_API_KEY are configured)
+      if (config.OMBI_URL && config.OMBI_API_KEY) {
+        try {
+          const ombi = new OmbiClient(config);
+          await runOmbiSync(ombi, nocodb, config);
+          results.ombiSync = 'ok';
+        } catch (err) {
+          app.log.error(err, 'Workflow: ombi-sync failed');
+          results.ombiSync = `error: ${err}`;
+        }
+      } else {
+        results.ombiSync = 'skipped (not configured)';
+      }
+
       // Search
       try {
         await runSearchScraper(warez, nocodb, config);

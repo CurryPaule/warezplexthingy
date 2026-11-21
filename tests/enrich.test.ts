@@ -466,3 +466,33 @@ describe('runEnrichScraper — movies', () => {
     expect(nocodbMocks.deactivateWatchlistItem).toHaveBeenCalledWith(2);
   });
 });
+
+describe('runEnrichScraper — inactive watchlist gating', () => {
+  it('skips series re-checks and found matches when watchlist item Active is false (without calling warez detail API)', async () => {
+    const { nocodb, nocodbMocks, warez, warezMocks } = createMocks({
+      foundMatches: [
+        makeMatch({ Id: 10, WatchlistId: 1, WarezUid: 'uid-inactive-found', Status: 'found' }),
+      ],
+      recheckSeries: [
+        makeMatch({ Id: 11, WatchlistId: 2, WarezUid: 'uid-inactive-recheck', Status: 'processed', Episode: 4 }),
+      ],
+      watchlist: {
+        1: makeWatchlistItem({ Id: 1, Active: 0 }),
+        2: makeWatchlistItem({ Id: 2, Active: false, LastEpisodeFound: 4 }),
+      },
+      releasesByUid: {
+        'uid-inactive-found': [makeRelease({ options: { episode_count_in_season: '8' } })],
+        'uid-inactive-recheck': [makeRelease({ options: { episode_count_in_season: '8' } })],
+      },
+    });
+
+    await runEnrichScraper(warez, nocodb, TEST_CONFIG, {
+      sleepFn: noopSleep,
+      isHosterOnlineFn: alwaysOnline,
+    });
+
+    expect(warezMocks.fetchEntryDetail).not.toHaveBeenCalled();
+    expect(nocodbMocks.updateMatchRelease).not.toHaveBeenCalled();
+    expect(nocodbMocks.upsertMatch).not.toHaveBeenCalled();
+  });
+});

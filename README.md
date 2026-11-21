@@ -8,11 +8,12 @@ A Fastify REST API server exposes all scraper modes as HTTP endpoints:
 
 | Endpoint | What it does |
 |---|---|
+| `POST /api/ombi-sync` | Syncs approved Ombi movie & TV requests into the NocoDB `watchlist` (with release-date gating) |
 | `POST /api/search` | Queries the warez search API for each watchlist item to find media entries |
-| `POST /api/enrich` | Fetches full release detail, applies filters, re-checks series for new episodes |
+| `POST /api/enrich` | Fetches full release detail, applies filters, re-checks active series for new episodes |
 | `POST /api/push` | Sends matched downloads to JDownloader (filters episodes for series re-checks) |
 | `POST /api/sort` | Sorts completed downloads into Plex/Jellyfin directory structure via FileBrowser |
-| `POST /api/workflow` | Runs the full pipeline: search → enrich → push |
+| `POST /api/workflow` | Runs the full pipeline: ombi-sync (if configured) → search → enrich → push |
 | `GET /api/health` | Health check |
 
 ### Match Status Flow
@@ -165,6 +166,13 @@ Key variables:
 | `NOCODB_MATCHES_TABLE_ID` | Same for matches table |
 | `NOCODB_STATE_TABLE_ID` | Same for state table |
 | `SEARCH_DELAY_MS` | Delay between API queries in ms (default 1500) |
+| `DEFAULT_QUALITY` | Default quality for Ombi-synced watchlist items: `720p`, `1080p`, `2160p`, or `any` (default: `1080p`; 4K Ombi requests automatically use `2160p`) |
+| `DEFAULT_LANG` | Default `LangRequired` for Ombi-synced watchlist items (default: `GER`) |
+| `DEFAULT_TAGS` | Default `Tags` (comma-separated) for Ombi-synced watchlist items (default: empty) |
+| `OMBI_URL` | Ombi base URL, e.g. `http://localhost:3579` (optional — enables Ombi sync) |
+| `OMBI_API_KEY` | Ombi API key from Settings → Configuration → General (optional — enables Ombi sync) |
+| `OMBI_MOVIE_DIGITAL_LOOKAHEAD_DAYS` | Days before a movie's `digitalReleaseDate` to enable scanning (default: `7`) |
+| `OMBI_SERIES_AIRDATE_LOOKAHEAD_DAYS` | Days before a season's first episode `airDate` to enable scanning (default: `1`) |
 | `JDOWNLOADER_EMAIL` | MyJDownloader account email (required for `push` mode) |
 | `JDOWNLOADER_PASSWORD` | MyJDownloader account password (required for `push` mode) |
 | `JDOWNLOADER_DEVICE_NAME` | JDownloader device name (required for `push` mode) |
@@ -216,6 +224,7 @@ npm start
 curl.exe -X POST http://localhost:3000/api/workflow
 
 # Individual steps
+curl.exe -X POST http://localhost:3000/api/ombi-sync
 curl.exe -X POST http://localhost:3000/api/search
 curl.exe -X POST http://localhost:3000/api/enrich
 curl.exe -X POST http://localhost:3000/api/push
@@ -235,6 +244,7 @@ npm run test:warez -- --search "Breaking Bad" # Test search with a query
 npm run test:nocodb                           # Test NocoDB connection
 npm run test:match                            # Dry-run matcher against live data
 npm run test:jdownloader                      # Test MyJDownloader connectivity
+npm run test:ombi                             # Dry-run Ombi connectivity & request mapping
 ```
 
 ## Docker

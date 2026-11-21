@@ -12,7 +12,8 @@
     "test:warez": "ts-node src/scripts/test-warez.ts",
     "test:nocodb": "ts-node src/scripts/test-nocodb.ts",
     "test:match": "ts-node src/scripts/test-match.ts",
-    "test:jdownloader": "ts-node src/scripts/test-jdownloader.ts"
+    "test:jdownloader": "ts-node src/scripts/test-jdownloader.ts",
+    "test:ombi": "ts-node src/scripts/test-ombi.ts"
   },
   "dependencies": {
     "fastify": "^5.8.5",
