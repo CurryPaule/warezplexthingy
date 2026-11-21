@@ -43,7 +43,10 @@ describe('isWebhookAuthorized', () => {
     expect(isWebhookAuthorized('s3cr3t', { headers: { applicationtoken: 's3cr3t' } })).toBe(true);
     expect(isWebhookAuthorized('s3cr3t', { headers: { 'x-webhook-secret': 's3cr3t' } })).toBe(true);
     expect(isWebhookAuthorized('s3cr3t', { headers: { authorization: 'Bearer s3cr3t' } })).toBe(true);
+    expect(isWebhookAuthorized('s3cr3t', { headers: { authorization: 's3cr3t' } })).toBe(true);
+    expect(isWebhookAuthorized('s3cr3t', { headers: { 'x-application-token': 's3cr3t' } })).toBe(true);
     expect(isWebhookAuthorized('s3cr3t', { headers: {}, body: { applicationToken: 's3cr3t' } })).toBe(true);
+    expect(isWebhookAuthorized('s3cr3t', { headers: {}, body: { token: 's3cr3t' } })).toBe(true);
   });
 });
 

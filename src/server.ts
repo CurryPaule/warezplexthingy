@@ -257,6 +257,9 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
           body,
         })
       ) {
+        console.warn(
+          `  ⚠ Ombi webhook 401: header keys=[${Object.keys(req.headers).join(', ')}], body keys=[${Object.keys(body).join(', ')}]`,
+        );
         reply.status(401);
         return { status: 'error', mode: 'ombi-webhook', error: 'Unauthorized webhook token' };
       }

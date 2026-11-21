@@ -91,14 +91,25 @@ export function isWebhookAuthorized(
   const authHeader = firstHeader('authorization');
   const bearerToken = authHeader?.toLowerCase().startsWith('bearer ')
     ? authHeader.slice(7).trim()
-    : undefined;
+    : authHeader;
+
+  const bodyRecord = params.body as Record<string, unknown> | null | undefined;
+  const bodyToken = (key: string): string | undefined => {
+    const val = bodyRecord?.[key];
+    return typeof val === 'string' && val.trim().length > 0 ? val.trim() : undefined;
+  };
 
   const candidates = [
     params.queryToken?.trim(),
     firstHeader('applicationtoken'),
+    firstHeader('x-application-token'),
     firstHeader('x-webhook-secret'),
+    firstHeader('token'),
     bearerToken,
-    typeof params.body?.applicationToken === 'string' ? params.body.applicationToken.trim() : undefined,
+    bodyToken('applicationToken'),
+    bodyToken('ApplicationToken'),
+    bodyToken('token'),
+    bodyToken('Token'),
   ].filter((c): c is string => Boolean(c));
 
   return candidates.includes(expectedSecret);
