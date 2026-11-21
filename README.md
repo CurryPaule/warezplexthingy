@@ -176,6 +176,7 @@ Key variables:
 | `OMBI_API_KEY` | Ombi API key from Settings → Configuration → General (optional — enables Ombi sync) |
 | `OMBI_MOVIE_DIGITAL_LOOKAHEAD_DAYS` | Days before a movie's `digitalReleaseDate` to enable scanning (default: `7`) |
 | `OMBI_SERIES_AIRDATE_LOOKAHEAD_DAYS` | Days before a season's first episode `airDate` to enable scanning (default: `1`) |
+| `OMBI_PLEX_SYNC_DELAY_MS` | Delay in ms after `/api/sort` before triggering Ombi's Plex Recently Added sync (default: `15000`) |
 | `JDOWNLOADER_EMAIL` | MyJDownloader account email (required for `push` mode) |
 | `JDOWNLOADER_PASSWORD` | MyJDownloader account password (required for `push` mode) |
 | `JDOWNLOADER_DEVICE_NAME` | JDownloader device name (required for `push` mode) |

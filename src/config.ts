@@ -58,6 +58,7 @@ const ConfigSchema = z.object({
   OMBI_API_KEY: emptyToUndefined,
   OMBI_MOVIE_DIGITAL_LOOKAHEAD_DAYS: z.coerce.number().int().nonnegative().default(7),
   OMBI_SERIES_AIRDATE_LOOKAHEAD_DAYS: z.coerce.number().int().nonnegative().default(1),
+  OMBI_PLEX_SYNC_DELAY_MS: z.coerce.number().int().nonnegative().default(15000),
 
   // JDownloader (optional — required only for `push` mode)
   JDOWNLOADER_EMAIL: z.preprocess(

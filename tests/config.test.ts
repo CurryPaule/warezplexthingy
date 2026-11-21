@@ -33,6 +33,7 @@ describe('parseConfig', () => {
     expect(cfg.PREFERRED_GROUPS).toBe('');
     expect(cfg.OMBI_MOVIE_DIGITAL_LOOKAHEAD_DAYS).toBe(7);
     expect(cfg.OMBI_SERIES_AIRDATE_LOOKAHEAD_DAYS).toBe(1);
+    expect(cfg.OMBI_PLEX_SYNC_DELAY_MS).toBe(15000);
     expect(cfg.AUTOTAGS_FALLBACK_HOURS).toBe(48);
   });
 

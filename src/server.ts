@@ -32,6 +32,36 @@ export function buildServer(config: Config): FastifyInstance {
   const nocodb = new NocoDbClient(config);
   const warez = new WarezClient(config);
 
+  // Debounced background trigger for Ombi's Plex Recently Added sync after /api/sort
+  let ombiPlexSyncTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const scheduleOmbiPlexSync = () => {
+    if (!config.OMBI_URL || !config.OMBI_API_KEY) return;
+    if (ombiPlexSyncTimer) clearTimeout(ombiPlexSyncTimer);
+
+    const delayMs = config.OMBI_PLEX_SYNC_DELAY_MS;
+    console.log(`  🔔 Scheduled Ombi Plex Recently Added sync in ${Math.round(delayMs / 1000)}s`);
+
+    ombiPlexSyncTimer = setTimeout(() => {
+      ombiPlexSyncTimer = null;
+      const ombi = new OmbiClient(config);
+      ombi.triggerPlexRecentlyAddedSync()
+        .then(() => {
+          console.log('  ✅ Triggered Ombi Plex Recently Added sync');
+        })
+        .catch((err) => {
+          app.log.warn(err, 'Failed to trigger Ombi Plex Recently Added sync');
+        });
+    }, delayMs);
+  };
+
+  app.addHook('onClose', async () => {
+    if (ombiPlexSyncTimer) {
+      clearTimeout(ombiPlexSyncTimer);
+      ombiPlexSyncTimer = null;
+    }
+  });
+
   // ─── Health ──────────────────────────────────────────────────────────────────
 
   app.get('/api/health', async () => {
@@ -230,6 +260,7 @@ export function buildServer(config: Config): FastifyInstance {
       const result = await sortDownload(fb, nocodb, config, metadataDirName, scanPath);
 
       if (result.success) {
+        scheduleOmbiPlexSync();
         return {
           status: 'ok',
           mode: 'sort',

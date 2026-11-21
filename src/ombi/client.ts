@@ -46,6 +46,19 @@ export class OmbiClient {
     return Array.isArray(data) ? data : [];
   }
 
+  /** Trigger Ombi's Plex Recently Added sync job (POST /api/v1/Job/plexrecentlyadded) */
+  async triggerPlexRecentlyAddedSync(): Promise<void> {
+    const url = `${this.baseUrl}/api/v1/Job/plexrecentlyadded`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: this.headers,
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Ombi POST /api/v1/Job/plexrecentlyadded → ${response.status}: ${text}`);
+    }
+  }
+
   /** Health / status check (returns HTTP status text or version info) */
   async getStatus(): Promise<string> {
     const url = `${this.baseUrl}/api/v1/Status`;

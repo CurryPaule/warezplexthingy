@@ -8,7 +8,7 @@ import {
 import type { Config } from '../src/config';
 import type { NocoDbClient } from '../src/nocodb/client';
 import type { WatchlistRow } from '../src/nocodb/types';
-import type { OmbiClient } from '../src/ombi/client';
+import { OmbiClient } from '../src/ombi/client';
 import type { OmbiMovieRequest, OmbiTvRequest } from '../src/ombi/types';
 
 const NOW = new Date('2026-11-21T12:00:00Z');
@@ -514,5 +514,29 @@ describe('runOmbiSync — TV shows', () => {
     expect(seasons[0]!.tmdbId).toBe(94997);
     expect(seasons[0]!.initialLastEpisodeFound).toBe(1);
     expect(seasons[0]!.highestRequestedEpisode).toBe(2);
+  });
+});
+
+describe('OmbiClient.triggerPlexRecentlyAddedSync', () => {
+  it('sends POST /api/v1/Job/plexrecentlyadded with ApiKey header', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response('true', { status: 200 }),
+    );
+    try {
+      const client = new OmbiClient({
+        OMBI_URL: 'https://ombi.example.com/',
+        OMBI_API_KEY: 'secret-key',
+      });
+      await client.triggerPlexRecentlyAddedSync();
+      expect(fetchSpy).toHaveBeenCalledWith(
+        'https://ombi.example.com/api/v1/Job/plexrecentlyadded',
+        expect.objectContaining({
+          method: 'POST',
+          headers: expect.objectContaining({ ApiKey: 'secret-key' }),
+        }),
+      );
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });
