@@ -32,6 +32,7 @@ describe('parseConfig', () => {
     expect(cfg.DEFAULT_TAGS).toBe('');
     expect(cfg.OMBI_MOVIE_DIGITAL_LOOKAHEAD_DAYS).toBe(7);
     expect(cfg.OMBI_SERIES_AIRDATE_LOOKAHEAD_DAYS).toBe(1);
+    expect(cfg.AUTOTAGS_FALLBACK_HOURS).toBe(48);
   });
 
   it('treats empty DEFAULT_QUALITY as 1080p and "any" as empty string', () => {

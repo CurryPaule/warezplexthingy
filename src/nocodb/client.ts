@@ -243,6 +243,11 @@ export class NocoDbClient {
     await this.request('PATCH', url, { id, fields: { LastEpisodeFound: episode } });
   }
 
+  /** Update the auto-pinned release profile (AutoTags) for a series watchlist item */
+  async updateWatchlistAutoTags(id: number, autoTags: string): Promise<void> {
+    await this.updateWatchlistItem(id, { AutoTags: autoTags });
+  }
+
   /** Deactivate a watchlist item (e.g. after DeactivateOnMatch) */
   async deactivateWatchlistItem(id: number): Promise<void> {
     const url = `${this.tablePath(this.watchlistTableId)}/records`;

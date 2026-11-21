@@ -110,7 +110,8 @@ Create three tables in NocoDB manually:
 | `TmdbId` | Number | Optional |
 | `Quality` | Single Select | `720p`, `1080p`, `2160p` (leave blank for any) |
 | `LangRequired` | Text | Comma-separated e.g. `GER,ENG` |
-| `Tags` | Multi Select | AND filter against fulltitle (e.g. `HDR`, `WEB`, `H265`, uploader name) |
+| `Tags` | Multi Select | Manual override — AND filter against fulltitle (e.g. `HDR`, `WEB`, `H265`, uploader name). Overrides `AutoTags` when set |
+| `AutoTags` | Single Line Text | Auto-populated for series on first match when `Tags` is empty (e.g. `HDR,265,AMZN,WAYNE` or `SDR,264,SAUERKRAUT`) to keep episode quality/source consistent |
 | `Season` | Number | Series season number (blank = any) |
 | `LastEpisodeFound` | Number | Auto-updated — highest episode count matched so far |
 | `Active` | Checkbox | Uncheck to pause monitoring |
@@ -169,6 +170,7 @@ Key variables:
 | `DEFAULT_QUALITY` | Default quality for Ombi-synced watchlist items: `720p`, `1080p`, `2160p`, or `any` (default: `1080p`; 4K Ombi requests automatically use `2160p`) |
 | `DEFAULT_LANG` | Default `LangRequired` for Ombi-synced watchlist items (default: `GER`) |
 | `DEFAULT_TAGS` | Default `Tags` (comma-separated) for Ombi-synced watchlist items (default: empty) |
+| `AUTOTAGS_FALLBACK_HOURS` | Hours to wait for a series's pinned release group/source (`AutoTags`) before falling back to same `HDR/SDR + codec` (default: `48`) |
 | `OMBI_URL` | Ombi base URL, e.g. `http://localhost:3579` (optional — enables Ombi sync) |
 | `OMBI_API_KEY` | Ombi API key from Settings → Configuration → General (optional — enables Ombi sync) |
 | `OMBI_MOVIE_DIGITAL_LOOKAHEAD_DAYS` | Days before a movie's `digitalReleaseDate` to enable scanning (default: `7`) |
@@ -299,8 +301,10 @@ If NocoDB runs in Docker too, uncomment the `networks` section in `docker/docker
 2. **Normalized title** — lowercased, dots/dashes stripped, then compared. The release's `title` field (provided by warez, clean) and an extracted version of `fulltitle` are both checked.
 3. **Quality filter** — tiers: `720p`, `1080p`, `2160p`. Set `Quality` to match only that exact quality tier.
 4. **Language filter** — `LangRequired = GER,ENG` means the release must include both German and English audio.
-5. **Tags filter** — all tags must appear in the release fulltitle (AND logic, case-insensitive). Use for format filters (`HDR`, `WEB`, `H265`) or to pin a specific uploader for consistent quality.
-6. **Season filter** — for series, set `Season = 2` to only match season 2 releases.
+5. **Tags filter** — all manual `Tags` must appear in the release fulltitle (AND logic, case-insensitive). When set, manual `Tags` completely override `AutoTags`.
+6. **Release preference ladder** — when multiple releases match (or no `Tags` are set), candidates are ranked down `HDR` → `265/HEVC` → `264/AVC` → fallback (tie-breaking by `DL` dual-language, `265` inside `HDR`, episode count, and popularity), walking down the ladder automatically if higher-tier hosters are offline.
+7. **Series `AutoTags` pinning** — when a series without manual `Tags` matches its first release, its profile (`HDR/SDR`, codec, streaming source, release group) is saved to `AutoTags` so subsequent episodes stay consistent (`SDR` explicitly rejects `HDR/DV`). If the pinned group/source stops uploading, after `AUTOTAGS_FALLBACK_HOURS` (default `48h`) it falls back to another group with the same `HDR/SDR + codec` and updates `AutoTags`.
+8. **Season filter** — for series, set `Season = 2` to only match season 2 releases.
 
 ### Episode Tracking
 
