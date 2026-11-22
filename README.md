@@ -192,6 +192,9 @@ Key variables:
 | `FILEBROWSER_DOWNLOAD_PATH` | Download directory path in FileBrowser (required for `sort` mode) |
 | `MEDIA_MOVIES_PATH` | Movies directory path in FileBrowser (required for `sort` mode) |
 | `MEDIA_SHOWS_PATH` | TV shows directory path in FileBrowser (required for `sort` mode) |
+| `NTFY_URL` | ntfy server base URL (default: `https://ntfy.sh` — change for self-hosted ntfy) |
+| `NTFY_TOPIC` | Optional ntfy channel/topic for rich manual-download alerts when automated push fails |
+| `NTFY_TOKEN` | Optional Bearer token for auth-protected ntfy topics |
 
 ### Finding your NocoDB Table IDs
 

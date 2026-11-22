@@ -17,6 +17,7 @@ export interface CrawledLink {
   packageUUID: string;
   size: number;
   availability?: LinkAvailability;
+  status?: string;
 }
 
 export interface CrawledPackage {
@@ -137,6 +138,7 @@ export class JDownloaderClient {
       packageUUID: true,
       bytesTotal: true,
       availability: true,
+      status: true,
     });
     // Response is { data: [...], rid: ... }
     const items: any[] = Array.isArray(result) ? result : ((result as any)?.data ?? []);
@@ -147,6 +149,7 @@ export class JDownloaderClient {
       packageUUID: String(link.packageUUID ?? ''),
       size: link.bytesTotal ?? 0,
       ...(link.availability !== undefined ? { availability: String(link.availability) } : {}),
+      ...(link.status !== undefined ? { status: String(link.status) } : {}),
     }));
   }
 

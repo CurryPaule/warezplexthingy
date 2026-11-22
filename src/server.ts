@@ -7,6 +7,7 @@ import { WarezClient } from './warez/api';
 import { JDownloaderClient } from './jdownloader/client';
 import { FileBrowserClient } from './filebrowser/client';
 import { OmbiClient } from './ombi/client';
+import { NtfyClient, isNtfyConfigured } from './ntfy/client';
 import {
   classifyOmbiWebhookEvent,
   isWebhookAuthorized,
@@ -44,6 +45,7 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
 
   const nocodb = new NocoDbClient(config);
   const warez = new WarezClient(config);
+  const ntfy = isNtfyConfigured(config) ? new NtfyClient(config) : undefined;
 
   const execOmbiSync = deps.runOmbiSyncFn ?? (async () => {
     const ombi = new OmbiClient(config);
@@ -63,7 +65,7 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
     try {
       jdownloader = new JDownloaderClient(config);
       await jdownloader.connect();
-      await runPushScraper(jdownloader, nocodb, config);
+      await runPushScraper(jdownloader, nocodb, config, { warez, ntfy });
     } finally {
       if (jdownloader) {
         await jdownloader.disconnect().catch(() => {});
@@ -319,7 +321,7 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
     try {
       jdownloader = new JDownloaderClient(config);
       await jdownloader.connect();
-      await runPushScraper(jdownloader, nocodb, config);
+      await runPushScraper(jdownloader, nocodb, config, { warez, ntfy });
       return { status: 'ok', mode: 'push' };
     } catch (err) {
       app.log.error(err, 'Push scraper failed');

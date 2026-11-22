@@ -85,6 +85,14 @@ const ConfigSchema = z.object({
   FILEBROWSER_DOWNLOAD_PATH: emptyToUndefined, // e.g. "/downloads"
   MEDIA_MOVIES_PATH: emptyToUndefined,         // e.g. "/media/movies"
   MEDIA_SHOWS_PATH: emptyToUndefined,          // e.g. "/media/shows"
+
+  // ntfy notifications (optional — alerts when automated push fails and manual download is needed)
+  NTFY_URL: z.preprocess(
+    (val) => (typeof val === 'string' && val.trim() === '' ? undefined : val),
+    z.string().url().default('https://ntfy.sh'),
+  ),
+  NTFY_TOPIC: emptyToUndefined,
+  NTFY_TOKEN: emptyToUndefined,
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
