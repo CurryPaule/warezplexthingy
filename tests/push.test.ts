@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   buildMetadataPath,
+  buildPushCandidates,
   findPushedLinks,
   getEpisodeFilterRange,
   partitionLinksByEpisodes,
@@ -12,7 +13,10 @@ import {
 import type { Config } from '../src/config';
 import type { CrawledLink, CrawledPackage, JDownloaderClient } from '../src/jdownloader/client';
 import type { NocoDbClient } from '../src/nocodb/client';
-import type { MatchRow } from '../src/nocodb/types';
+import type { MatchRow, WatchlistRow } from '../src/nocodb/types';
+import type { WarezClient } from '../src/warez/api';
+import type { WarezDetailRelease } from '../src/warez/types';
+import type { NtfyClient } from '../src/ntfy/client';
 
 const TEST_CONFIG = {
   SEARCH_DELAY_MS: 0,
@@ -42,8 +46,20 @@ function makeMatch(overrides: Partial<MatchRow> = {}): MatchRow & { Id: number }
   };
 }
 
-function makeLink(uuid: number, name: string, packageUUID = '100'): CrawledLink {
-  return { uuid, name, url: `https://ddownload.com/${uuid}`, packageUUID, size: 1_000_000 };
+function makeLink(
+  uuid: number,
+  name: string,
+  packageUUID = '100',
+  extra: Partial<CrawledLink> = {},
+): CrawledLink {
+  return {
+    uuid,
+    name,
+    url: `https://ddownload.com/${uuid}`,
+    packageUUID,
+    size: 1_000_000,
+    ...extra,
+  };
 }
 
 function makePkg(uuid: number, name: string, saveTo: string, childCount = 0): CrawledPackage {
@@ -412,5 +428,527 @@ describe('runPushScraper — multi-episode & multi-part bugfixes', () => {
     );
 
     expect(jdMocks.moveToDownloadList).toHaveBeenCalledWith([1, 2]);
+  });
+});
+
+describe('runPushScraper — direct link verification, Cloudflare fallback & ntfy alerts', () => {
+  it('orders non-Cloudflare sources before filecrypt.cc containers while respecting hoster priority', () => {
+    const directJson = JSON.stringify({
+      'rapidgator.net': ['https://rapidgator.net/file/1'],
+      'ddownload.com': ['https://ddownload.com/part1'],
+    });
+    const cryptedJson = JSON.stringify({
+      'rapidgator.net': 'https://hide.cx/container/RG',
+      'ddownload.com': 'https://filecrypt.cc/Container/DDL.html',
+    });
+
+    // Movie: all direct links first → non-Cloudflare containers (hide.cx) → filecrypt.cc last
+    expect(
+      buildPushCandidates(
+        makeMatch({ Type: 'movie', Fulltitle: 'The.House.That.Jack.Built.2018.1080p', Links: directJson, CryptedLinks: cryptedJson }),
+        ['ddownload', 'rapidgator'],
+      ),
+    ).toEqual([
+      { source: 'direct', hoster: 'ddownload.com', urls: ['https://ddownload.com/part1'] },
+      { source: 'direct', hoster: 'rapidgator.net', urls: ['https://rapidgator.net/file/1'] },
+      { source: 'crypted', hoster: 'rapidgator.net', urls: ['https://hide.cx/container/RG'] },
+      { source: 'crypted', hoster: 'ddownload.com', urls: ['https://filecrypt.cc/Container/DDL.html'] },
+    ]);
+
+    // Season pack: non-Cloudflare containers first → filecrypt.cc → direct last-resort
+    expect(
+      buildPushCandidates(
+        makeMatch({ Type: 'series', Fulltitle: 'Show.S02.1080p.WEB.H265-WAYNE', Links: directJson, CryptedLinks: cryptedJson }),
+        ['ddownload', 'rapidgator'],
+      ),
+    ).toEqual([
+      { source: 'crypted', hoster: 'rapidgator.net', urls: ['https://hide.cx/container/RG'] },
+      { source: 'crypted', hoster: 'ddownload.com', urls: ['https://filecrypt.cc/Container/DDL.html'] },
+      { source: 'direct', hoster: 'ddownload.com', urls: ['https://ddownload.com/part1'] },
+      { source: 'direct', hoster: 'rapidgator.net', urls: ['https://rapidgator.net/file/1'] },
+    ]);
+  });
+
+  it('finds pushed direct links by URL even when JD puts offline files in an Offline Files package with hash names', () => {
+    const existing = new Set<number>();
+    const packages = [makePkg(500, 'Offline Files', '/output/other')];
+    const allLinks = [
+      makeLink(10, 'a81vaylyxsbj', '500', { url: 'https://ddownload.com/a81vaylyxsbj', availability: 'OFFLINE' }),
+      makeLink(11, 'fxplh3w53k8p', '500', { url: 'https://ddownload.com/fxplh3w53k8p/movie.part02.rar', availability: 'OFFLINE' }),
+      makeLink(12, 'unrelated.rar', '500', { url: 'https://ddownload.com/otherfile', availability: 'ONLINE' }),
+    ];
+
+    const { links } = findPushedLinks(
+      allLinks,
+      packages,
+      existing,
+      'tt4003440-movie',
+      'The.House.That.Jack.Built.2018.German.EAC3.DL.1080p.BluRay.x265-VECTOR',
+      ['https://ddownload.com/a81vaylyxsbj', 'https://ddownload.com/fxplh3w53k8p'],
+    );
+
+    expect(links.map(l => l.uuid)).toEqual([10, 11]);
+  });
+
+  it('removes stale offline direct links AND Cloudflare-blocked filecrypt link, sends ntfy alert, and deduplicates on next run (The House That Jack Built case)', async () => {
+    const directUrls = [
+      'https://ddownload.com/a81vaylyxsbj',
+      'https://ddownload.com/fxplh3w53k8p',
+    ];
+    const containerUrl = 'https://filecrypt.cc/Container/1A6366B3D5.html';
+
+    const match = makeMatch({
+      Id: 42,
+      WarezId: 149533,
+      WarezUid: 'HLCmGK0UmWMt',
+      Type: 'movie',
+      Title: 'The House That Jack Built',
+      Fulltitle: 'The.House.That.Jack.Built.2018.German.EAC3.DL.1080p.BluRay.x265-VECTOR',
+      ImdbId: 'tt4003440',
+      Season: undefined,
+      Episode: undefined,
+      SeasonEpisodeKey: undefined,
+      Links: JSON.stringify({ 'ddownload.com': directUrls }),
+      CryptedLinks: JSON.stringify({ 'ddownload.com': containerUrl }),
+    });
+
+    const offlinePkg = makePkg(500, 'Offline Files', '/output/tt4003440-movie');
+    const p1Unknown = makeLink(1, 'a81vaylyxsbj', '500', { url: directUrls[0], availability: 'UNKNOWN' });
+    const p2Unknown = makeLink(2, 'fxplh3w53k8p', '500', { url: directUrls[1], availability: 'UNKNOWN' });
+    const p1Offline = makeLink(1, 'a81vaylyxsbj', '500', { url: directUrls[0], availability: 'OFFLINE' });
+    const p2Offline = makeLink(2, 'fxplh3w53k8p', '500', { url: directUrls[1], availability: 'OFFLINE' });
+    const cfBlocked = makeLink(3, 'Blocked by!Cloudflare Site-Protection', '501', {
+      url: containerUrl,
+      availability: 'OFFLINE',
+      status: 'Blocked by!Cloudflare Site-Protection',
+    });
+
+    const snapshots: CrawledLink[][] = [
+      // Attempt 1: direct links → UNKNOWN → OFFLINE
+      [],
+      [p1Unknown, p2Unknown],
+      [p1Offline, p2Offline],
+      [p1Offline, p2Offline],
+      // Attempt 2: filecrypt.cc container → Cloudflare blocked link
+      [],
+      [cfBlocked],
+      [cfBlocked],
+    ];
+    let idx = 0;
+
+    const jdMocks = {
+      pushLinks: vi.fn(async () => {}),
+      isCollecting: vi.fn(async () => false),
+      queryPackages: vi.fn(async () => [offlinePkg]),
+      queryLinks: vi.fn(async () => snapshots[idx++] ?? [cfBlocked]),
+      removeLinks: vi.fn(async () => {}),
+      moveToDownloadList: vi.fn(async () => {}),
+      startDownloads: vi.fn(async () => {}),
+    };
+
+    const stateStore = new Map<string, string>();
+    const nocodbMocks = {
+      getMatchesByStatus: vi.fn(async () => [match]),
+      updateMatchRelease: vi.fn(async () => {}),
+      getState: vi.fn(async (k: string) => stateStore.get(k) ?? null),
+      setState: vi.fn(async (k: string, v: string) => { stateStore.set(k, v); }),
+    };
+
+    const ntfyMocks = {
+      notifyManualDownload: vi.fn(async () => {}),
+    };
+
+    // Run 1: both direct links and filecrypt container fail → cleaned up + ntfy notified
+    await runPushScraper(
+      jdMocks as unknown as JDownloaderClient,
+      nocodbMocks as unknown as NocoDbClient,
+      TEST_CONFIG,
+      {
+        pollDelayMs: 0,
+        maxPollAttempts: 10,
+        stablePollsRequired: 2,
+        sleepFn: noopSleep,
+        ntfy: ntfyMocks as unknown as NtfyClient,
+      },
+    );
+
+    expect(jdMocks.pushLinks).toHaveBeenNthCalledWith(1, {
+      links: directUrls,
+      packageName: match.Fulltitle,
+      autostart: false,
+      destinationFolder: 'tt4003440-movie',
+    });
+    expect(jdMocks.pushLinks).toHaveBeenNthCalledWith(2, {
+      links: [containerUrl],
+      packageName: match.Fulltitle,
+      autostart: false,
+      destinationFolder: 'tt4003440-movie',
+    });
+    expect(jdMocks.removeLinks).toHaveBeenNthCalledWith(1, [1, 2]);
+    expect(jdMocks.removeLinks).toHaveBeenNthCalledWith(2, [3]);
+    expect(jdMocks.moveToDownloadList).not.toHaveBeenCalled();
+    expect(nocodbMocks.updateMatchRelease).not.toHaveBeenCalled();
+
+    expect(ntfyMocks.notifyManualDownload).toHaveBeenCalledTimes(1);
+    expect(ntfyMocks.notifyManualDownload).toHaveBeenCalledWith(
+      match,
+      expect.objectContaining({
+        metadataPath: 'tt4003440-movie',
+        containerUrl,
+        reason: expect.stringContaining('Cloudflare'),
+      }),
+    );
+
+    // Run 2 (next cron): match is already notified in scraper_state → skipped without re-pushing or re-notifying!
+    await runPushScraper(
+      jdMocks as unknown as JDownloaderClient,
+      nocodbMocks as unknown as NocoDbClient,
+      TEST_CONFIG,
+      {
+        pollDelayMs: 0,
+        maxPollAttempts: 10,
+        stablePollsRequired: 2,
+        sleepFn: noopSleep,
+        ntfy: ntfyMocks as unknown as NtfyClient,
+      },
+    );
+
+    expect(jdMocks.pushLinks).toHaveBeenCalledTimes(2);
+    expect(ntfyMocks.notifyManualDownload).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to non-Cloudflare hide.cx container when direct links have an offline part', async () => {
+    const directUrls = ['https://ddownload.com/p1', 'https://ddownload.com/p2', 'https://ddownload.com/p3'];
+    const hideUrl = 'https://hide.cx/container/PARTIAL';
+
+    const match = makeMatch({
+      Id: 43,
+      Type: 'movie',
+      Fulltitle: 'Partial.Offline.2025.1080p-GRP',
+      ImdbId: 'tt1111111',
+      Season: undefined,
+      Episode: undefined,
+      SeasonEpisodeKey: undefined,
+      Links: JSON.stringify({ 'ddownload.com': directUrls }),
+      CryptedLinks: JSON.stringify({ 'ddownload.com': hideUrl }),
+    });
+
+    const pkg = makePkg(501, match.Fulltitle, '/output/tt1111111-movie');
+    const crawled = [
+      makeLink(1, 'part01.rar', '501', { url: directUrls[0], availability: 'ONLINE' }),
+      makeLink(2, 'part02.rar', '501', { url: directUrls[1], availability: 'OFFLINE' }),
+      makeLink(3, 'part03.rar', '501', { url: directUrls[2], availability: 'ONLINE' }),
+    ];
+
+    let call = 0;
+    const jdMocks = {
+      pushLinks: vi.fn(async () => {}),
+      isCollecting: vi.fn(async () => false),
+      queryPackages: vi.fn(async () => [pkg]),
+      queryLinks: vi.fn(async () => (call++ === 0 ? [] : crawled)),
+      removeLinks: vi.fn(async () => {}),
+      moveToDownloadList: vi.fn(async () => {}),
+      startDownloads: vi.fn(async () => {}),
+    };
+    const nocodbMocks = {
+      getMatchesByStatus: vi.fn(async () => [match]),
+      updateMatchRelease: vi.fn(async () => {}),
+    };
+
+    await runPushScraper(
+      jdMocks as unknown as JDownloaderClient,
+      nocodbMocks as unknown as NocoDbClient,
+      TEST_CONFIG,
+      { pollDelayMs: 0, maxPollAttempts: 10, stablePollsRequired: 2, sleepFn: noopSleep },
+    );
+
+    expect(jdMocks.removeLinks).toHaveBeenCalledWith([1, 2, 3]);
+    expect(jdMocks.pushLinks).toHaveBeenCalledTimes(2);
+    expect(jdMocks.pushLinks).toHaveBeenNthCalledWith(2, {
+      links: [hideUrl],
+      packageName: match.Fulltitle,
+      autostart: true,
+      destinationFolder: 'tt1111111-movie',
+    });
+    expect(nocodbMocks.updateMatchRelease).toHaveBeenCalledWith(43, { Status: 'pushed' });
+  });
+
+  it('moves verified online direct links directly to download list without touching CryptedLinks', async () => {
+    const directUrls = ['https://ddownload.com/ok1', 'https://ddownload.com/ok2'];
+    const containerUrl = 'https://filecrypt.cc/Container/UNUSED.html';
+
+    const match = makeMatch({
+      Id: 44,
+      Type: 'movie',
+      Fulltitle: 'Healthy.Movie.2025.1080p-GRP',
+      ImdbId: 'tt2222222',
+      Season: undefined,
+      Episode: undefined,
+      SeasonEpisodeKey: undefined,
+      Links: JSON.stringify({ 'ddownload.com': directUrls }),
+      CryptedLinks: JSON.stringify({ 'ddownload.com': containerUrl }),
+    });
+
+    const pkg = makePkg(502, match.Fulltitle, '/output/tt2222222-movie');
+    const online = [
+      makeLink(10, 'Healthy.Movie.part01.rar', '502', { url: directUrls[0], availability: 'ONLINE' }),
+      makeLink(11, 'Healthy.Movie.part02.rar', '502', { url: directUrls[1], availability: 'ONLINE' }),
+    ];
+
+    let call = 0;
+    const jdMocks = {
+      pushLinks: vi.fn(async () => {}),
+      isCollecting: vi.fn(async () => false),
+      queryPackages: vi.fn(async () => [pkg]),
+      queryLinks: vi.fn(async () => (call++ === 0 ? [] : online)),
+      removeLinks: vi.fn(async () => {}),
+      moveToDownloadList: vi.fn(async () => {}),
+      startDownloads: vi.fn(async () => {}),
+    };
+    const nocodbMocks = {
+      getMatchesByStatus: vi.fn(async () => [match]),
+      updateMatchRelease: vi.fn(async () => {}),
+    };
+
+    await runPushScraper(
+      jdMocks as unknown as JDownloaderClient,
+      nocodbMocks as unknown as NocoDbClient,
+      TEST_CONFIG,
+      { pollDelayMs: 0, maxPollAttempts: 10, stablePollsRequired: 2, sleepFn: noopSleep },
+    );
+
+    expect(jdMocks.pushLinks).toHaveBeenCalledTimes(1);
+    expect(jdMocks.removeLinks).not.toHaveBeenCalled();
+    expect(jdMocks.moveToDownloadList).toHaveBeenCalledWith([10, 11]);
+    expect(jdMocks.startDownloads).toHaveBeenCalledTimes(1);
+    expect(nocodbMocks.updateMatchRelease).toHaveBeenCalledWith(44, { Status: 'pushed' });
+  });
+
+  it('falls back to hide.cx container when JDownloader discards offline direct links (0 links in linkgrabber)', async () => {
+    const directUrls = ['https://ddownload.com/dropped1'];
+    const hideUrl = 'https://hide.cx/container/FALLBACK';
+
+    const match = makeMatch({
+      Id: 45,
+      Type: 'movie',
+      Fulltitle: 'Dropped.Direct.2025.1080p-GRP',
+      ImdbId: 'tt3333333',
+      Season: undefined,
+      Episode: undefined,
+      SeasonEpisodeKey: undefined,
+      Links: JSON.stringify({ 'ddownload.com': directUrls }),
+      CryptedLinks: JSON.stringify({ 'ddownload.com': hideUrl }),
+    });
+
+    const jdMocks = {
+      pushLinks: vi.fn(async () => {}),
+      isCollecting: vi.fn(async () => false),
+      queryPackages: vi.fn(async () => []),
+      queryLinks: vi.fn(async () => []),
+      removeLinks: vi.fn(async () => {}),
+      moveToDownloadList: vi.fn(async () => {}),
+      startDownloads: vi.fn(async () => {}),
+    };
+    const nocodbMocks = {
+      getMatchesByStatus: vi.fn(async () => [match]),
+      updateMatchRelease: vi.fn(async () => {}),
+    };
+
+    await runPushScraper(
+      jdMocks as unknown as JDownloaderClient,
+      nocodbMocks as unknown as NocoDbClient,
+      TEST_CONFIG,
+      { pollDelayMs: 0, maxPollAttempts: 10, stablePollsRequired: 2, maxEmptyIdlePolls: 2, sleepFn: noopSleep },
+    );
+
+    expect(jdMocks.pushLinks).toHaveBeenCalledTimes(2);
+    expect(jdMocks.pushLinks).toHaveBeenNthCalledWith(2, {
+      links: [hideUrl],
+      packageName: match.Fulltitle,
+      autostart: true,
+      destinationFolder: 'tt3333333-movie',
+    });
+    expect(nocodbMocks.updateMatchRelease).toHaveBeenCalledWith(45, { Status: 'pushed' });
+  });
+
+  it('falls back to an alternate online release on warez.cx when the primary release fails all candidates', async () => {
+    const primaryDirect = ['https://ddownload.com/stale1'];
+    const primaryContainer = 'https://filecrypt.cc/Container/BLOCKED.html';
+    const altDirect = ['https://ddownload.com/fresh1', 'https://ddownload.com/fresh2'];
+
+    const match = makeMatch({
+      Id: 47,
+      WatchlistId: 7,
+      WarezId: 201,
+      WarezUid: 'uid-alt-movie',
+      Type: 'movie',
+      Title: 'Fallback Movie',
+      Fulltitle: 'Fallback.Movie.2024.German.DL.1080p.BluRay.x265-VECTOR',
+      ImdbId: 'tt5555555',
+      Season: undefined,
+      Episode: undefined,
+      SeasonEpisodeKey: undefined,
+      Links: JSON.stringify({ 'ddownload.com': primaryDirect }),
+      CryptedLinks: JSON.stringify({ 'ddownload.com': primaryContainer }),
+    });
+
+    const watchlistItem: WatchlistRow & { Id: number } = {
+      Id: 7,
+      Title: 'Fallback Movie',
+      Type: 'movie',
+      ImdbId: 'tt5555555',
+      Active: 0,
+      DeactivateOnMatch: 1,
+      Quality: '1080p',
+      LangRequired: 'GER',
+    };
+
+    const altRelease: WarezDetailRelease = {
+      id: 202,
+      uid: 'rel-202',
+      user_id: 99,
+      entry_id: 55,
+      title: 'Fallback Movie',
+      fulltitle: 'Fallback.Movie.2024.German.DL.1080p.BluRay.x264-BACKUP',
+      type: 'movie',
+      sub_type: 'movie',
+      links: { 'ddownload.com': altDirect },
+      crypted_links: { 'ddownload.com': 'https://filecrypt.cc/Container/ALT.html' },
+      size: 8_000_000_000,
+      parts: 2,
+      group: 'BACKUP',
+      quality: '1080p',
+      video_stream: 'BD',
+      video_codec: 'H264',
+      audio_stream: null,
+      bitrate: null,
+      lang: ['DE', 'EN'],
+      downloads: 50,
+      source: 'web',
+      options: { check: { 'ddownload.com': 'https://hide.cx/state/online' } },
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      deleted_at: null,
+      episode_updated_at: null,
+      has_new_episode: false,
+      display_priority: 0,
+    };
+
+    const staleLink = makeLink(1, 'stale1', '700', { url: primaryDirect[0], availability: 'OFFLINE' });
+    const cfLink = makeLink(2, 'Blocked by!Cloudflare Site-Protection', '701', { url: primaryContainer, availability: 'OFFLINE' });
+    const freshLinks = [
+      makeLink(10, 'Fallback.Movie.part1.rar', '702', { url: altDirect[0], availability: 'ONLINE' }),
+      makeLink(11, 'Fallback.Movie.part2.rar', '702', { url: altDirect[1], availability: 'ONLINE' }),
+    ];
+
+    const snapshots: CrawledLink[][] = [
+      [], [staleLink], [staleLink],        // primary direct → OFFLINE
+      [], [cfLink], [cfLink],              // primary filecrypt → Cloudflare blocked
+      [], freshLinks, freshLinks,          // alternate release direct → ONLINE!
+    ];
+    let idx = 0;
+
+    const jdMocks = {
+      pushLinks: vi.fn(async () => {}),
+      isCollecting: vi.fn(async () => false),
+      queryPackages: vi.fn(async () => [makePkg(702, altRelease.fulltitle, '/output/tt5555555-movie')]),
+      queryLinks: vi.fn(async () => snapshots[idx++] ?? freshLinks),
+      removeLinks: vi.fn(async () => {}),
+      moveToDownloadList: vi.fn(async () => {}),
+      startDownloads: vi.fn(async () => {}),
+    };
+    const nocodbMocks = {
+      getMatchesByStatus: vi.fn(async () => [match]),
+      getWatchlistItemById: vi.fn(async () => watchlistItem),
+      updateMatchRelease: vi.fn(async () => {}),
+      getState: vi.fn(async () => null),
+      setState: vi.fn(async () => {}),
+    };
+    const warezMocks = {
+      fetchEntryDetail: vi.fn(async () => ({ releases: [altRelease] })),
+    };
+    const ntfyMocks = {
+      notifyManualDownload: vi.fn(async () => {}),
+    };
+
+    await runPushScraper(
+      jdMocks as unknown as JDownloaderClient,
+      nocodbMocks as unknown as NocoDbClient,
+      TEST_CONFIG,
+      {
+        pollDelayMs: 0,
+        maxPollAttempts: 10,
+        stablePollsRequired: 2,
+        sleepFn: noopSleep,
+        warez: warezMocks as unknown as WarezClient,
+        ntfy: ntfyMocks as unknown as NtfyClient,
+        isHosterOnlineFn: async () => true,
+      },
+    );
+
+    expect(jdMocks.removeLinks).toHaveBeenNthCalledWith(1, [1]);
+    expect(jdMocks.removeLinks).toHaveBeenNthCalledWith(2, [2]);
+    expect(jdMocks.moveToDownloadList).toHaveBeenCalledWith([10, 11]);
+    expect(jdMocks.startDownloads).toHaveBeenCalledTimes(1);
+    expect(nocodbMocks.updateMatchRelease).toHaveBeenCalledWith(
+      47,
+      expect.objectContaining({
+        WarezId: 202,
+        Fulltitle: altRelease.fulltitle,
+        ReleaseGroup: 'BACKUP',
+        Status: 'pushed',
+      }),
+    );
+    expect(ntfyMocks.notifyManualDownload).not.toHaveBeenCalled();
+  });
+
+  it('does not mark match as pushed when all direct hoster candidates are OFFLINE and no container fallback exists', async () => {
+    const match = makeMatch({
+      Id: 46,
+      Type: 'movie',
+      Fulltitle: 'All.Dead.2025.1080p-GRP',
+      ImdbId: 'tt4444444',
+      Season: undefined,
+      Episode: undefined,
+      SeasonEpisodeKey: undefined,
+      Links: JSON.stringify({
+        'ddownload.com': ['https://ddownload.com/dead1'],
+        'rapidgator.net': ['https://rapidgator.net/file/dead2'],
+      }),
+      CryptedLinks: '{}',
+    });
+
+    const ddlDead = makeLink(1, 'dead1', '600', { url: 'https://ddownload.com/dead1', availability: 'OFFLINE' });
+    const rgDead = makeLink(2, 'dead2', '601', { url: 'https://rapidgator.net/file/dead2', availability: 'OFFLINE' });
+    const snapshots: CrawledLink[][] = [
+      [], [ddlDead], [ddlDead], // ddownload attempt
+      [], [rgDead], [rgDead],   // rapidgator attempt
+    ];
+    let idx = 0;
+
+    const jdMocks = {
+      pushLinks: vi.fn(async () => {}),
+      isCollecting: vi.fn(async () => false),
+      queryPackages: vi.fn(async () => []),
+      queryLinks: vi.fn(async () => snapshots[idx++] ?? []),
+      removeLinks: vi.fn(async () => {}),
+      moveToDownloadList: vi.fn(async () => {}),
+      startDownloads: vi.fn(async () => {}),
+    };
+    const nocodbMocks = {
+      getMatchesByStatus: vi.fn(async () => [match]),
+      updateMatchRelease: vi.fn(async () => {}),
+    };
+
+    await runPushScraper(
+      jdMocks as unknown as JDownloaderClient,
+      nocodbMocks as unknown as NocoDbClient,
+      TEST_CONFIG,
+      { pollDelayMs: 0, maxPollAttempts: 10, stablePollsRequired: 2, sleepFn: noopSleep },
+    );
+
+    expect(jdMocks.removeLinks).toHaveBeenNthCalledWith(1, [1]);
+    expect(jdMocks.removeLinks).toHaveBeenNthCalledWith(2, [2]);
+    expect(nocodbMocks.updateMatchRelease).not.toHaveBeenCalled();
   });
 });

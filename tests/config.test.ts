@@ -48,4 +48,21 @@ describe('parseConfig', () => {
     expect(cfg.OMBI_URL).toBeUndefined();
     expect(cfg.OMBI_API_KEY).toBeUndefined();
   });
+
+  it('defaults NTFY_URL to https://ntfy.sh and treats empty NTFY_TOPIC/NTFY_TOKEN as undefined', () => {
+    const defaults = parseConfig({ ...BASE_ENV, NTFY_URL: '', NTFY_TOPIC: '', NTFY_TOKEN: '' });
+    expect(defaults.NTFY_URL).toBe('https://ntfy.sh');
+    expect(defaults.NTFY_TOPIC).toBeUndefined();
+    expect(defaults.NTFY_TOKEN).toBeUndefined();
+
+    const custom = parseConfig({
+      ...BASE_ENV,
+      NTFY_URL: 'https://ntfy.myhost.de',
+      NTFY_TOPIC: 'currypaule_warez_scraper',
+      NTFY_TOKEN: 'tk_abc',
+    });
+    expect(custom.NTFY_URL).toBe('https://ntfy.myhost.de');
+    expect(custom.NTFY_TOPIC).toBe('currypaule_warez_scraper');
+    expect(custom.NTFY_TOKEN).toBe('tk_abc');
+  });
 });

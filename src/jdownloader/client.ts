@@ -8,12 +8,16 @@ export interface PushLinksOptions {
   destinationFolder?: string;
 }
 
+export type LinkAvailability = 'ONLINE' | 'OFFLINE' | 'UNKNOWN' | 'TEMP_UNKNOWN' | string;
+
 export interface CrawledLink {
   uuid: number;
   name: string;
   url: string;
   packageUUID: string;
   size: number;
+  availability?: LinkAvailability;
+  status?: string;
 }
 
 export interface CrawledPackage {
@@ -133,6 +137,8 @@ export class JDownloaderClient {
       url: true,
       packageUUID: true,
       bytesTotal: true,
+      availability: true,
+      status: true,
     });
     // Response is { data: [...], rid: ... }
     const items: any[] = Array.isArray(result) ? result : ((result as any)?.data ?? []);
@@ -142,6 +148,8 @@ export class JDownloaderClient {
       url: link.url ?? '',
       packageUUID: String(link.packageUUID ?? ''),
       size: link.bytesTotal ?? 0,
+      ...(link.availability !== undefined ? { availability: String(link.availability) } : {}),
+      ...(link.status !== undefined ? { status: String(link.status) } : {}),
     }));
   }
 
