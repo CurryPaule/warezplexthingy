@@ -3,6 +3,8 @@ import type { NocoDbClient } from '../nocodb/client';
 import type { WatchlistRow } from '../nocodb/types';
 import type { OmbiClient } from '../ombi/client';
 import type { OmbiMovieRequest, OmbiTvRequest } from '../ombi/types';
+import type { NtfyClient } from '../ntfy/client';
+import { formatErrorMessage, safeNotifyError } from '../ntfy/client';
 import { normalizeTitle } from '../matcher';
 
 const MS_PER_DAY = 86_400_000;
@@ -10,6 +12,8 @@ const MS_PER_DAY = 86_400_000;
 export interface OmbiSyncOptions {
   /** Override current time (for deterministic testing) */
   now?: Date;
+  /** Optional ntfy client — sends an emergency error ping if any item fails to sync */
+  ntfy?: NtfyClient;
 }
 
 export interface OmbiSyncSummary {
@@ -139,7 +143,7 @@ export function evaluateMovieRequest(
 
   return {
     type: 'movie',
-    title: req.title.trim(),
+    title: (req.title ?? '').trim(),
     imdbId: normalizeImdbId(req.imdbId),
     tmdbId: req.theMovieDbId && req.theMovieDbId > 0 ? req.theMovieDbId : undefined,
     isApproved,
@@ -245,7 +249,7 @@ export function evaluateTvRequest(
 
     items.push({
       type: 'series',
-      title: tv.title.trim(),
+      title: (tv.title ?? '').trim(),
       imdbId: tvImdbId,
       tmdbId: tvTmdbId,
       season: seasonNum,
@@ -412,17 +416,30 @@ export async function runOmbiSync(
   );
 
   const desiredItems: DesiredWatchlistItem[] = [];
+  const syncErrors: string[] = [];
 
   for (const movie of movieRequests) {
-    desiredItems.push(
-      evaluateMovieRequest(movie, now, config.OMBI_MOVIE_DIGITAL_LOOKAHEAD_DAYS),
-    );
+    try {
+      desiredItems.push(
+        evaluateMovieRequest(movie, now, config.OMBI_MOVIE_DIGITAL_LOOKAHEAD_DAYS),
+      );
+    } catch (err) {
+      const msg = formatErrorMessage(err);
+      console.error(`  ❌ Ombi sync failed evaluating movie "${movie?.title ?? 'unknown'}":`, err);
+      syncErrors.push(`Movie "${movie?.title ?? 'unknown'}": ${msg}`);
+    }
   }
 
   for (const tv of tvRequests) {
-    desiredItems.push(
-      ...evaluateTvRequest(tv, now, config.OMBI_SERIES_AIRDATE_LOOKAHEAD_DAYS),
-    );
+    try {
+      desiredItems.push(
+        ...evaluateTvRequest(tv, now, config.OMBI_SERIES_AIRDATE_LOOKAHEAD_DAYS),
+      );
+    } catch (err) {
+      const msg = formatErrorMessage(err);
+      console.error(`  ❌ Ombi sync failed evaluating TV show "${tv?.title ?? 'unknown'}":`, err);
+      syncErrors.push(`TV "${tv?.title ?? 'unknown'}": ${msg}`);
+    }
   }
 
   const summary: OmbiSyncSummary = {
@@ -437,69 +454,76 @@ export async function runOmbiSync(
   const matchedWatchlistIds = new Set<number>();
 
   for (const desired of desiredItems) {
-    const existing = findMatchingWatchlistRow(desired, allWatchlist, matchedWatchlistIds);
     const label = desired.type === 'series' && desired.season != null
       ? `${desired.title} S${String(desired.season).padStart(2, '0')}`
       : desired.title;
 
-    if (existing) {
-      matchedWatchlistIds.add(existing.Id);
+    try {
+      const existing = findMatchingWatchlistRow(desired, allWatchlist, matchedWatchlistIds);
 
-      const currentActive = Boolean(existing.Active);
-      const desiredActive = computeDesiredActive(desired, existing);
-      const updates: Partial<WatchlistRow> = {};
+      if (existing) {
+        matchedWatchlistIds.add(existing.Id);
 
-      if (currentActive !== desiredActive) {
-        updates.Active = desiredActive;
-      }
-      if (!existing.ImdbId && desired.imdbId) {
-        updates.ImdbId = desired.imdbId;
-      }
-      if (!existing.TmdbId && desired.tmdbId) {
-        updates.TmdbId = desired.tmdbId;
-      }
+        const currentActive = Boolean(existing.Active);
+        const desiredActive = computeDesiredActive(desired, existing);
+        const updates: Partial<WatchlistRow> = {};
 
-      if (Object.keys(updates).length > 0) {
-        await nocodb.updateWatchlistItem(existing.Id, updates);
-        if (updates.Active === true) {
-          summary.activated++;
-          console.log(`  🟢 Activated: [${label}]`);
-        } else if (updates.Active === false) {
-          summary.deactivated++;
-          const reason = !desired.isApproved
-            ? 'denied/unapproved'
-            : desired.isAvailable
-              ? 'available in Ombi'
-              : !desired.isReleased
-                ? `unreleased (${desired.releaseDateLabel ?? 'tbd'})`
-                : 'all episodes matched';
-          console.log(`  🔕 Deactivated: [${label}] (${reason})`);
+        if (currentActive !== desiredActive) {
+          updates.Active = desiredActive;
+        }
+        if (!existing.ImdbId && desired.imdbId) {
+          updates.ImdbId = desired.imdbId;
+        }
+        if (!existing.TmdbId && desired.tmdbId) {
+          updates.TmdbId = desired.tmdbId;
+        }
+
+        if (Object.keys(updates).length > 0) {
+          await nocodb.updateWatchlistItem(existing.Id, updates);
+          if (updates.Active === true) {
+            summary.activated++;
+            console.log(`  🟢 Activated: [${label}]`);
+          } else if (updates.Active === false) {
+            summary.deactivated++;
+            const reason = !desired.isApproved
+              ? 'denied/unapproved'
+              : desired.isAvailable
+                ? 'available in Ombi'
+                : !desired.isReleased
+                  ? `unreleased (${desired.releaseDateLabel ?? 'tbd'})`
+                  : 'all episodes matched';
+            console.log(`  🔕 Deactivated: [${label}] (${reason})`);
+          } else {
+            summary.updated++;
+            console.log(`  📝 Backfilled IDs for: [${label}]`);
+          }
         } else {
-          summary.updated++;
-          console.log(`  📝 Backfilled IDs for: [${label}]`);
+          summary.unchanged++;
         }
       } else {
-        summary.unchanged++;
-      }
-    } else {
-      // Do not clutter NocoDB with denied, unapproved, or already-available requests
-      if (!desired.isApproved || desired.isAvailable) {
-        continue;
-      }
+        // Do not clutter NocoDB with denied, unapproved, or already-available requests
+        if (!desired.isApproved || desired.isAvailable) {
+          continue;
+        }
 
-      const newRow = buildNewWatchlistRow(desired, config);
-      const created = await nocodb.createWatchlistItem(newRow);
-      matchedWatchlistIds.add(created.Id);
-      summary.created++;
-      if (newRow.Active) summary.createdActive++;
+        const newRow = buildNewWatchlistRow(desired, config);
+        const created = await nocodb.createWatchlistItem(newRow);
+        matchedWatchlistIds.add(created.Id);
+        summary.created++;
+        if (newRow.Active) summary.createdActive++;
 
-      const statusIcon = newRow.Active ? '✅' : '⏳';
-      const statusText = newRow.Active
-        ? 'Active'
-        : `Inactive (waiting for ${desired.releaseDateLabel ?? 'release'})`;
-      console.log(
-        `  ${statusIcon} Created: [${label}] (${newRow.Quality || 'any'}, ${newRow.LangRequired || 'any'}) → ${statusText}`,
-      );
+        const statusIcon = newRow.Active ? '✅' : '⏳';
+        const statusText = newRow.Active
+          ? 'Active'
+          : `Inactive (waiting for ${desired.releaseDateLabel ?? 'release'})`;
+        console.log(
+          `  ${statusIcon} Created: [${label}] (${newRow.Quality || 'any'}, ${newRow.LangRequired || 'any'}) → ${statusText}`,
+        );
+      }
+    } catch (err) {
+      const msg = formatErrorMessage(err);
+      console.error(`  ❌ Ombi sync failed for [${label}]:`, err);
+      syncErrors.push(`${label}: ${msg}`);
     }
   }
 
@@ -508,17 +532,32 @@ export async function runOmbiSync(
     if (matchedWatchlistIds.has(row.Id)) continue;
     if (!row.Active) continue;
 
-    await nocodb.updateWatchlistItem(row.Id, { Active: false });
-    summary.deactivated++;
     const label = row.Type === 'series' && row.Season != null
       ? `${row.Title} S${String(row.Season).padStart(2, '0')}`
       : row.Title;
-    console.log(`  🔕 Deactivated: [${label}] (no longer requested/approved in Ombi)`);
+
+    try {
+      await nocodb.updateWatchlistItem(row.Id, { Active: false });
+      summary.deactivated++;
+      console.log(`  🔕 Deactivated: [${label}] (no longer requested/approved in Ombi)`);
+    } catch (err) {
+      const msg = formatErrorMessage(err);
+      console.error(`  ❌ Ombi sync failed deactivating [${label}]:`, err);
+      syncErrors.push(`Deactivate ${label}: ${msg}`);
+    }
   }
 
   console.log(
-    `✔ Ombi sync done. Created: ${summary.created}, Activated: ${summary.activated}, Deactivated: ${summary.deactivated}, Updated: ${summary.updated}, Unchanged: ${summary.unchanged}`,
+    `✔ Ombi sync done. Created: ${summary.created}, Activated: ${summary.activated}, Deactivated: ${summary.deactivated}, Updated: ${summary.updated}, Unchanged: ${summary.unchanged}${syncErrors.length > 0 ? `, Failed: ${syncErrors.length}` : ''}`,
   );
+
+  if (syncErrors.length > 0) {
+    await safeNotifyError(options.ntfy, {
+      source: 'ombi-sync',
+      summary: `${syncErrors.length} item(s) failed during Ombi sync`,
+      errors: syncErrors,
+    });
+  }
 
   return summary;
 }

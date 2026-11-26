@@ -7,6 +7,8 @@ import type {
   WatchlistRow,
 } from './types';
 
+const NOCODB_FETCH_TIMEOUT_MS = 30_000;
+
 /**
  * NocoDB v3 API client.
  * URL pattern: /api/v3/data/{baseId}/{tableId}/records
@@ -38,16 +40,23 @@ export class NocoDbClient {
   }
 
   private async request<T>(method: string, url: string, body?: unknown): Promise<T> {
-    const response = await fetch(url, {
-      method,
-      headers: this.headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`NocoDB ${method} ${url} → ${response.status}: ${text}`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), NOCODB_FETCH_TIMEOUT_MS);
+    try {
+      const response = await fetch(url, {
+        method,
+        headers: this.headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`NocoDB ${method} ${url} → ${response.status}: ${text}`);
+      }
+      return response.json() as Promise<T>;
+    } finally {
+      clearTimeout(timer);
     }
-    return response.json() as Promise<T>;
   }
 
   /** Flatten a v3 record: merge { id, fields } → fields with Id added */
@@ -62,8 +71,9 @@ export class NocoDbClient {
 
     while (url) {
       const data: NocoDbV3ListResponse<T> = await this.request('GET', url);
-      results.push(...data.records.map(r => this.flatten(r)));
-      url = data.next ?? null;
+      const records = Array.isArray(data?.records) ? data.records : [];
+      results.push(...records.map(r => this.flatten(r)));
+      url = data?.next ?? null;
     }
 
     return results;

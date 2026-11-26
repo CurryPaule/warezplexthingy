@@ -5,6 +5,7 @@ import type { NocoDbClient } from '../src/nocodb/client';
 import type { MatchRow, WatchlistRow } from '../src/nocodb/types';
 import type { WarezClient } from '../src/warez/api';
 import type { WarezDetailRelease } from '../src/warez/types';
+import type { NtfyClient } from '../src/ntfy/client';
 
 const TEST_CONFIG = {
   SEARCH_DELAY_MS: 0,
@@ -785,5 +786,159 @@ describe('isPngPaletteGreen (filecrypt.cc status badge)', () => {
   it('returns false for red offline or yellow partial filecrypt PNG palette', () => {
     expect(isPngPaletteGreen(buildMinimalIndexedPng([[0, 0, 0], [175, 29, 26], [198, 45, 39]]))).toBe(false);
     expect(isPngPaletteGreen(buildMinimalIndexedPng([[0, 0, 0], [220, 170, 30]]))).toBe(false);
+  });
+});
+
+describe('runEnrichScraper — malformed releases & error isolation failsafe', () => {
+  it('handles warez.cx releases containing lang: [null], title: null, and null links (Doctor Who S13 regression)', async () => {
+    const { nocodb, nocodbMocks, warez } = createMocks({
+      foundMatches: [
+        makeMatch({
+          Id: 70,
+          WatchlistId: 7,
+          WarezUid: 'uj5EeeSIMvJo',
+          Title: 'Doctor Who',
+          Fulltitle: 'Doctor Who',
+          Season: undefined,
+          Episode: undefined,
+          SeasonEpisodeKey: undefined,
+          Status: 'found',
+        }),
+      ],
+      watchlist: {
+        7: makeWatchlistItem({
+          Id: 7,
+          Title: 'Doctor Who',
+          ImdbId: 'tt0436992',
+          Season: 13,
+          Quality: '1080p',
+          LangRequired: 'GER',
+          LastEpisodeFound: 0,
+        }),
+      },
+      releasesByUid: {
+        uj5EeeSIMvJo: [
+          makeRelease({
+            id: 76129,
+            title: null,
+            fulltitle: 'Doctor.Who.S14.German.DL.EAC3.1080p.DSNP.WEB.H265-ZeroTwo',
+            quality: '1080p',
+            lang: [null],
+            video_codec: null,
+            links: null,
+            crypted_links: null,
+            options: { episode_count_in_season: '4' },
+          }),
+          makeRelease({
+            id: 39967,
+            title: 'Doctor Who',
+            fulltitle: 'Doctor.Who.2005.S13.German.DL.1080p.WEB.h264-WvF',
+            quality: '1080p',
+            lang: ['GER', 'ENG'],
+            group: 'WvF',
+            options: { episode_count_in_season: '2' },
+          }),
+        ],
+      },
+    });
+
+    await runEnrichScraper(warez, nocodb, TEST_CONFIG, {
+      sleepFn: noopSleep,
+      isHosterOnlineFn: alwaysOnline,
+    });
+
+    expect(nocodbMocks.updateMatchRelease).toHaveBeenCalledWith(
+      70,
+      expect.objectContaining({
+        WarezId: 39967,
+        Season: 13,
+        Episode: 2,
+        SeasonEpisodeKey: 'S13E01-E02',
+        Status: 'matched',
+      }),
+    );
+  });
+
+  it('isolates per-item errors so subsequent enriches still succeed and sends an ntfy error alert', async () => {
+    const { nocodb, nocodbMocks, warez } = createMocks({
+      foundMatches: [
+        makeMatch({
+          Id: 80,
+          WatchlistId: 8,
+          WarezUid: 'uid-broken',
+          Title: 'Broken Show',
+          Fulltitle: 'Broken Show',
+          Season: undefined,
+          Episode: undefined,
+          SeasonEpisodeKey: undefined,
+          Status: 'found',
+        }),
+        makeMatch({
+          Id: 81,
+          WatchlistId: 9,
+          WarezUid: 'uid-good-movie',
+          Title: 'Good Movie',
+          Fulltitle: 'Good Movie',
+          Type: 'movie',
+          Season: undefined,
+          Episode: undefined,
+          SeasonEpisodeKey: undefined,
+          Status: 'found',
+        }),
+      ],
+      watchlist: {
+        8: makeWatchlistItem({ Id: 8, Title: 'Broken Show', Season: 1, LastEpisodeFound: 0 }),
+        9: makeWatchlistItem({ Id: 9, Title: 'Good Movie', Type: 'movie', Season: undefined, DeactivateOnMatch: 1 }),
+      },
+      releasesByUid: {
+        'uid-broken': [
+          makeRelease({
+            id: 801,
+            fulltitle: 'Broken.Show.S01.GERMAN.DL.1080p.WEB.H264-GRP',
+            options: { episode_count_in_season: '3' },
+          }),
+        ],
+        'uid-good-movie': [
+          makeRelease({
+            id: 901,
+            type: 'movie',
+            fulltitle: 'Good.Movie.2026.GERMAN.DL.1080p.WEB.H264-GRP',
+            options: {},
+          }),
+        ],
+      },
+    });
+
+    // Simulate an unexpected failure only when updating the first match
+    nocodbMocks.updateMatchRelease.mockImplementationOnce(async () => {
+      throw new Error('NocoDB write exploded');
+    });
+
+    const notifyError = vi.fn(async () => {});
+    const mockNtfy = { notifyError } as unknown as NtfyClient;
+
+    await runEnrichScraper(warez, nocodb, TEST_CONFIG, {
+      sleepFn: noopSleep,
+      isHosterOnlineFn: alwaysOnline,
+      ntfy: mockNtfy,
+    });
+
+    // Second item MUST still be enriched despite first item throwing!
+    expect(nocodbMocks.updateMatchRelease).toHaveBeenCalledTimes(2);
+    expect(nocodbMocks.updateMatchRelease).toHaveBeenLastCalledWith(
+      81,
+      expect.objectContaining({ WarezId: 901, Status: 'matched' }),
+    );
+
+    // Emergency ntfy error alert must have been sent for the failed item
+    expect(notifyError).toHaveBeenCalledTimes(1);
+    expect(notifyError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: 'enrich',
+        warezUid: 'uid-broken',
+        title: 'Broken Show',
+        errors: [expect.stringContaining('NocoDB write exploded')],
+      }),
+    );
   });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { buildWarezDetailUrl, isNtfyConfigured, NtfyClient } from '../src/ntfy/client';
+import { buildWarezDetailUrl, isNtfyConfigured, NtfyClient, safeNotifyError } from '../src/ntfy/client';
 
 describe('ntfy client', () => {
   it('builds warez.cx detail deeplinks matching site slug format', () => {
@@ -114,5 +114,52 @@ describe('ntfy client', () => {
     expect(body.title).toBe('Überleben (S01E05) — Manual download needed');
     expect(body.tags).toEqual(['warning', 'tv']);
     expect(body.actions).toHaveLength(1);
+  });
+
+  it('publishes high-priority error alert via notifyError with warez.cx deeplink and truncation', async () => {
+    const mockFetch = vi.fn(async () => new Response('{}', { status: 200 }));
+    const client = new NtfyClient(
+      { NTFY_URL: 'https://ntfy.sh', NTFY_TOPIC: 'alerts', NTFY_TOKEN: undefined },
+      mockFetch as unknown as typeof fetch,
+    );
+
+    const manyErrors = Array.from({ length: 12 }, (_, i) => `Item ${i + 1}: boom`);
+    await client.notifyError({
+      source: 'enrich',
+      summary: 'Doctor Who (uj5EeeSIMvJo) failed',
+      errors: manyErrors,
+      warezUid: 'uj5EeeSIMvJo',
+      title: 'Doctor Who',
+    });
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [, init] = mockFetch.mock.calls[0] as unknown as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.title).toBe('Scraper error (enrich): Doctor Who (uj5EeeSIMvJo) failed');
+    expect(body.tags).toEqual(['rotating_light', 'x']);
+    expect(body.priority).toBe(4);
+    expect(body.click).toBe('https://warez.cx/detail/uj5EeeSIMvJo/Doctor-Who');
+    expect(body.actions).toEqual([
+      {
+        action: 'view',
+        label: 'Open on warez.cx',
+        url: 'https://warez.cx/detail/uj5EeeSIMvJo/Doctor-Who',
+      },
+    ]);
+    expect(body.message).toContain('Item 10: boom');
+    expect(body.message).toContain('…and 2 more error(s)');
+  });
+
+  it('safeNotifyError swallows ntfy failures without throwing', async () => {
+    const mockFetch = vi.fn(async () => new Response('down', { status: 503 }));
+    const client = new NtfyClient(
+      { NTFY_URL: 'https://ntfy.sh', NTFY_TOPIC: 'alerts', NTFY_TOKEN: undefined },
+      mockFetch as unknown as typeof fetch,
+    );
+
+    await expect(
+      safeNotifyError(client, { source: 'enrich', summary: 'test error', errors: ['fail'] }),
+    ).resolves.toBeUndefined();
+    expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 });

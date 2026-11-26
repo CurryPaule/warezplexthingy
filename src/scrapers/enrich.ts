@@ -2,6 +2,8 @@ import type { NocoDbClient } from '../nocodb/client';
 import type { MatchRow, WatchlistRow } from '../nocodb/types';
 import type { WarezClient } from '../warez/api';
 import type { WarezDetailRelease } from '../warez/types';
+import type { NtfyClient } from '../ntfy/client';
+import { formatErrorMessage, safeNotifyError } from '../ntfy/client';
 import type { Config } from '../config';
 import {
   matchesQuality,
@@ -33,6 +35,8 @@ export interface EnrichOptions {
   isHosterOnlineFn?: (stateUrl: string) => Promise<boolean>;
   /** Override current time (for deterministic grace-period testing) */
   now?: Date;
+  /** Optional ntfy client — sends an emergency error ping if any item fails during enrichment */
+  ntfy?: NtfyClient;
 }
 
 interface OnlineRelease {
@@ -101,17 +105,21 @@ export function isPngPaletteGreen(buf: Buffer): boolean {
  * Any error, timeout, or unparsable response is treated as offline.
  */
 export async function isHosterOnline(stateUrl: string): Promise<boolean> {
+  if (typeof stateUrl !== 'string' || !stateUrl.trim()) return false;
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ONLINE_CHECK_TIMEOUT_MS);
-    const response = await fetch(stateUrl, { signal: controller.signal });
-    clearTimeout(timer);
-    if (!response.ok) return false;
-    const buf = Buffer.from(await response.arrayBuffer());
-    if (buf.length >= 8 && buf.subarray(0, 8).equals(PNG_SIGNATURE)) {
-      return isPngPaletteGreen(buf);
+    try {
+      const response = await fetch(stateUrl, { signal: controller.signal });
+      if (!response.ok) return false;
+      const buf = Buffer.from(await response.arrayBuffer());
+      if (buf.length >= 8 && buf.subarray(0, 8).equals(PNG_SIGNATURE)) {
+        return isPngPaletteGreen(buf);
+      }
+      return buf.toString('utf8').includes('stroke="green"');
+    } finally {
+      clearTimeout(timer);
     }
-    return buf.toString('utf8').includes('stroke="green"');
   } catch {
     return false;
   }
@@ -127,13 +135,20 @@ export async function getOnlineHosters(
   checkOnline: (stateUrl: string) => Promise<boolean> = isHosterOnline,
 ): Promise<string[]> {
   const checkUrls = release.options?.check;
-  if (!checkUrls || Object.keys(checkUrls).length === 0) {
+  if (!checkUrls || typeof checkUrls !== 'object' || Array.isArray(checkUrls) || Object.keys(checkUrls).length === 0) {
     // No check info available — assume online (don't block releases without check data)
     return Object.keys(release.links ?? {});
   }
 
+  const entries = Object.entries(checkUrls).filter(
+    (entry): entry is [string, string] => typeof entry[1] === 'string' && entry[1].trim().length > 0,
+  );
+  if (entries.length === 0) {
+    return Object.keys(release.links ?? {});
+  }
+
   const results = await Promise.all(
-    Object.entries(checkUrls).map(async ([hoster, url]) => ({
+    entries.map(async ([hoster, url]) => ({
       hoster,
       online: await checkOnline(url),
     })),
@@ -154,8 +169,8 @@ function filterLinksToOnlineHosters(
   const cryptedLinks: Record<string, string> = {};
 
   for (const hoster of onlineHosters) {
-    if (release.links[hoster]) links[hoster] = release.links[hoster];
-    if (release.crypted_links[hoster]) cryptedLinks[hoster] = release.crypted_links[hoster];
+    if (release.links?.[hoster]) links[hoster] = release.links[hoster];
+    if (release.crypted_links?.[hoster]) cryptedLinks[hoster] = release.crypted_links[hoster];
   }
 
   return { links, cryptedLinks };
@@ -221,6 +236,11 @@ export function getEpisodeCount(release: WarezDetailRelease): number | null {
   return count > 0 ? count : null;
 }
 
+function sanitizeReleaseLangs(lang: WarezDetailRelease['lang']): string[] {
+  if (!Array.isArray(lang)) return [];
+  return lang.filter((l): l is string => typeof l === 'string' && l.trim().length > 0);
+}
+
 function buildReleaseFields(
   online: OnlineRelease,
   season: number | undefined,
@@ -229,17 +249,17 @@ function buildReleaseFields(
 ): Partial<MatchRow> {
   return {
     WarezId: online.release.id,
-    Fulltitle: online.release.fulltitle,
+    Fulltitle: online.release.fulltitle ?? '',
     Quality: online.release.quality ?? '',
-    Lang: JSON.stringify(online.release.lang),
+    Lang: JSON.stringify(sanitizeReleaseLangs(online.release.lang)),
     Links: JSON.stringify(online.links),
     CryptedLinks: JSON.stringify(online.cryptedLinks),
-    SizeBytes: online.release.size,
-    ReleaseGroup: online.release.group,
+    SizeBytes: online.release.size ?? 0,
+    ReleaseGroup: online.release.group ?? '',
     Season: season,
     Episode: episode,
     SeasonEpisodeKey: seasonEpisodeKey,
-    WarezCreatedAt: online.release.created_at,
+    WarezCreatedAt: online.release.created_at ?? '',
     Status: 'matched',
   };
 }
@@ -257,20 +277,20 @@ function buildNewMatchRecord(
     WarezId: online.release.id,
     WarezUid: template.WarezUid,
     Title: template.Title,
-    Fulltitle: online.release.fulltitle,
+    Fulltitle: online.release.fulltitle ?? '',
     Type: template.Type || watchlistItem.Type || 'series',
     Season: season,
     Episode: episode,
     SeasonEpisodeKey: seasonEpisodeKey,
     Quality: online.release.quality ?? '',
-    Lang: JSON.stringify(online.release.lang),
+    Lang: JSON.stringify(sanitizeReleaseLangs(online.release.lang)),
     Links: JSON.stringify(online.links),
     CryptedLinks: JSON.stringify(online.cryptedLinks),
-    SizeBytes: online.release.size,
-    ReleaseGroup: online.release.group,
+    SizeBytes: online.release.size ?? 0,
+    ReleaseGroup: online.release.group ?? '',
     ImdbId: template.ImdbId || watchlistItem.ImdbId || '',
     TmdbId: template.TmdbId || watchlistItem.TmdbId || 0,
-    WarezCreatedAt: online.release.created_at,
+    WarezCreatedAt: online.release.created_at ?? '',
     MatchedAt: new Date().toISOString(),
     Status: 'matched',
   };
@@ -718,6 +738,8 @@ export async function runEnrichScraper(
   let enriched = 0;
   let updated = 0;
   let skipped = 0;
+  let failed = 0;
+  const enrichErrors: { label: string; uid?: string; title?: string; message: string }[] = [];
 
   // Group active entries by WarezUid to avoid duplicate or wasted API calls
   const byUid = new Map<string, MatchEntry[]>();
@@ -729,6 +751,10 @@ export async function runEnrichScraper(
       continue;
     }
     const uid = entry.match.WarezUid;
+    if (!uid) {
+      skipped++;
+      continue;
+    }
     if (!byUid.has(uid)) byUid.set(uid, []);
     byUid.get(uid)!.push(entry);
   }
@@ -739,16 +765,29 @@ export async function runEnrichScraper(
   }
 
   for (const [uid, entries] of byUid) {
-    const label = entries[0]!.isRecheck ? '🔄' : '📦';
-    console.log(`  ${label} Fetching detail for: ${entries[0]!.match.Title} (${uid})`);
+    const firstEntry = entries[0]!;
+    const entryTitle = firstEntry.match.Title || uid;
+    const label = firstEntry.isRecheck ? '🔄' : '📦';
+    console.log(`  ${label} Fetching detail for: ${entryTitle} (${uid})`);
 
     let releases: WarezDetailRelease[];
     try {
       const detail = await warez.fetchEntryDetail(uid);
-      releases = detail.releases ?? [];
+      const rawReleases = Array.isArray(detail?.releases) ? detail.releases : [];
+      releases = rawReleases.filter(
+        (r): r is WarezDetailRelease => Boolean(r && typeof r === 'object'),
+      );
       console.log(`     → ${releases.length} release(s) available`);
     } catch (err) {
-      console.error(`  ⚠ Detail fetch failed for "${uid}":`, err);
+      const msg = formatErrorMessage(err);
+      console.error(`  ⚠ Detail fetch failed for "${entryTitle}" (${uid}):`, err);
+      failed++;
+      enrichErrors.push({
+        label: `${entryTitle} (${uid})`,
+        uid,
+        title: firstEntry.match.Title,
+        message: `Detail fetch failed: ${msg}`,
+      });
       await sleepFn(config.SEARCH_DELAY_MS);
       continue;
     }
@@ -774,12 +813,24 @@ export async function runEnrichScraper(
 
       if (watchlistItem.Type !== 'series') {
         for (const { match } of watchlistEntries) {
-          const result = await processMovieMatch(match, releases, watchlistItem, nocodb, config, checkOnline);
-          if (result === 'enriched') {
-            enriched++;
-            console.log(`  ✅ Enriched: [${watchlistItem.Title}] ← "${match.Title}"`);
-          } else {
-            skipped++;
+          try {
+            const result = await processMovieMatch(match, releases, watchlistItem, nocodb, config, checkOnline);
+            if (result === 'enriched') {
+              enriched++;
+              console.log(`  ✅ Enriched: [${watchlistItem.Title}] ← "${match.Title}"`);
+            } else {
+              skipped++;
+            }
+          } catch (err) {
+            const msg = formatErrorMessage(err);
+            console.error(`  ❌ Enrich failed for movie "${watchlistItem.Title}" (${uid}):`, err);
+            failed++;
+            enrichErrors.push({
+              label: `${watchlistItem.Title} (${uid})`,
+              uid,
+              title: watchlistItem.Title,
+              message: msg,
+            });
           }
         }
         continue;
@@ -795,24 +846,52 @@ export async function runEnrichScraper(
       }
 
       for (const [bucketSeason, bucketEntries] of bySeason) {
-        const res = await processSeriesBucket(
-          bucketEntries,
-          bucketSeason,
-          releases,
-          watchlistItem,
-          nocodb,
-          config,
-          checkOnline,
-          now,
-        );
-        enriched += res.enriched;
-        updated += res.updated;
-        skipped += res.skipped;
+        try {
+          const res = await processSeriesBucket(
+            bucketEntries,
+            bucketSeason,
+            releases,
+            watchlistItem,
+            nocodb,
+            config,
+            checkOnline,
+            now,
+          );
+          enriched += res.enriched;
+          updated += res.updated;
+          skipped += res.skipped;
+        } catch (err) {
+          const msg = formatErrorMessage(err);
+          const seasonSuffix = bucketSeason != null ? ` S${String(bucketSeason).padStart(2, '0')}` : '';
+          console.error(`  ❌ Enrich failed for series "${watchlistItem.Title}${seasonSuffix}" (${uid}):`, err);
+          failed++;
+          enrichErrors.push({
+            label: `${watchlistItem.Title}${seasonSuffix} (${uid})`,
+            uid,
+            title: watchlistItem.Title,
+            message: msg,
+          });
+        }
       }
     }
 
     await sleepFn(config.SEARCH_DELAY_MS);
   }
 
-  console.log(`✔ Enrichment done. Enriched: ${enriched}, Updated: ${updated}, Skipped: ${skipped}`);
+  console.log(
+    `✔ Enrichment done. Enriched: ${enriched}, Updated: ${updated}, Skipped: ${skipped}${failed > 0 ? `, Failed: ${failed}` : ''}`,
+  );
+
+  if (enrichErrors.length > 0) {
+    const single = enrichErrors.length === 1 ? enrichErrors[0]! : undefined;
+    await safeNotifyError(options.ntfy, {
+      source: 'enrich',
+      summary: single
+        ? `${single.label} failed`
+        : `${enrichErrors.length} item(s) failed during enrichment`,
+      errors: enrichErrors.map(e => `${e.label}: ${e.message}`),
+      warezUid: single?.uid,
+      title: single?.title,
+    });
+  }
 }

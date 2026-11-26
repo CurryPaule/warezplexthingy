@@ -22,7 +22,7 @@ export interface WarezRelease {
   video_codec: string | null;
   audio_stream: string | null;
   bitrate: string | null;
-  lang: string[] | null;
+  lang: (string | null)[] | null;
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
@@ -95,7 +95,7 @@ export interface WarezSearchEntry {
   uid: string;
   type: 'movie' | 'series' | 'game' | string;
   sub_type: string;
-  lang: string[] | null;
+  lang: (string | null)[] | null;
   tags: string | null;
   genre: string[];
   active: number;
@@ -141,21 +141,21 @@ export interface WarezDetailRelease {
   uid: string;
   user_id: number;
   entry_id: number;
-  title: string;
+  title: string | null;
   fulltitle: string;
   type: string;
   sub_type: string;
-  links: Record<string, string[]>;
-  crypted_links: Record<string, string>;
+  links: Record<string, string[]> | null;
+  crypted_links: Record<string, string> | null;
   size: number;
   parts: number;
-  group: string;
+  group: string | null;
   quality: string | null;
   video_stream: string | null;
   video_codec: string | null;
   audio_stream: string | null;
   bitrate: string | null;
-  lang: string[] | null;
+  lang: (string | null)[] | null;
   downloads: number;
   source: string;
   options: {
@@ -182,7 +182,7 @@ export interface WarezEntryDetail {
   title: string;
   original_title: string;
   fulltitle: string;
-  lang: string[] | null;
+  lang: (string | null)[] | null;
   genre: string[];
   options: WarezEntryOptions;
   releases: WarezDetailRelease[];

@@ -23,6 +23,47 @@ export interface ManualDownloadNotification {
   containerUrl?: string;
 }
 
+export interface ErrorNotification {
+  /** Subsystem or pipeline step where the error occurred (e.g. "enrich", "search", "push", "ombi-sync", "sort", "workflow") */
+  source: string;
+  /** Short summary shown in the notification title */
+  summary: string;
+  /** Detailed error lines (one per failed item/step) */
+  errors?: string[];
+  /** Optional warez.cx entry UID to attach a clickable deeplink */
+  warezUid?: string;
+  /** Optional media title for building the warez.cx URL slug */
+  title?: string;
+}
+
+const NTFY_TIMEOUT_MS = 10_000;
+const MAX_ERROR_LINES = 10;
+const MAX_ERROR_LINE_LENGTH = 300;
+
+export function formatErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message || err.name;
+  return String(err);
+}
+
+/**
+ * Best-effort error alert via ntfy. Never throws so notification outages can never break scraping.
+ */
+export async function safeNotifyError(
+  ntfy: NtfyClient | undefined,
+  details: ErrorNotification,
+): Promise<void> {
+  if (!ntfy) return;
+  try {
+    await ntfy.notifyError(details);
+    console.log(`  🔔 Sent ntfy error notification (${details.source})`);
+  } catch (err) {
+    console.warn(
+      `  ⚠ Failed to send ntfy error notification (${details.source}):`,
+      formatErrorMessage(err),
+    );
+  }
+}
+
 /**
  * Build a clickable warez.cx detail page deeplink from a match's WarezUid and Title.
  * Example: ("HLCmGK0UmWMt", "The House That Jack Built")
@@ -86,16 +127,66 @@ export class NtfyClient {
     if (msg.click) payload.click = msg.click;
     if (msg.actions && msg.actions.length > 0) payload.actions = msg.actions;
 
-    const response = await this.fetchFn(this.baseUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(payload),
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), NTFY_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await this.fetchFn(this.baseUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
 
     if (!response.ok) {
       const text = await response.text().catch(() => '');
       throw new Error(`ntfy POST ${this.baseUrl} → ${response.status}: ${text}`);
     }
+  }
+
+  /**
+   * Send a high-priority emergency ping when a scraper step or item fails with an unexpected error.
+   */
+  async notifyError(details: ErrorNotification): Promise<void> {
+    const rawErrors = (details.errors ?? [])
+      .map(line => line.trim())
+      .filter(Boolean);
+
+    const visibleLines = rawErrors.slice(0, MAX_ERROR_LINES).map(line =>
+      line.length > MAX_ERROR_LINE_LENGTH
+        ? `${line.slice(0, MAX_ERROR_LINE_LENGTH - 1)}…`
+        : line,
+    );
+
+    if (rawErrors.length > MAX_ERROR_LINES) {
+      visibleLines.push(`…and ${rawErrors.length - MAX_ERROR_LINES} more error(s)`);
+    }
+
+    const message = visibleLines.length > 0 ? visibleLines.join('\n') : details.summary;
+    const warezUrl = details.warezUid
+      ? buildWarezDetailUrl(details.warezUid, details.title)
+      : undefined;
+
+    const actions: NtfyAction[] = [];
+    if (warezUrl) {
+      actions.push({
+        action: 'view',
+        label: 'Open on warez.cx',
+        url: warezUrl,
+      });
+    }
+
+    await this.publish({
+      title: `Scraper error (${details.source}): ${details.summary}`,
+      message,
+      tags: ['rotating_light', 'x'],
+      priority: 4,
+      ...(warezUrl ? { click: warezUrl } : {}),
+      ...(actions.length > 0 ? { actions } : {}),
+    });
   }
 
   /**

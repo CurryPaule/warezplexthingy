@@ -55,7 +55,8 @@ export function parseDownloadMetadata(dirName: string): DownloadMetadata | null 
  * Extract the year from a fulltitle.
  * e.g. "Movie.Title.2024.German.DL.1080p" → 2024
  */
-function extractYear(fulltitle: string): number | null {
+function extractYear(fulltitle: string | null | undefined): number | null {
+  if (typeof fulltitle !== 'string' || !fulltitle) return null;
   const match = /\b((?:19|20)\d{2})\b/.exec(fulltitle);
   return match ? parseInt(match[1]!, 10) : null;
 }
@@ -477,7 +478,7 @@ export async function sortDownload(
 /**
  * Build a clean episode directory name.
  */
-function cleanEpisodeDirName(fulltitle: string, fallbackKey: string): string {
-  const cleaned = fulltitle.replace(/\.(mkv|mp4|avi|m4v|wmv|flv|mov|ts)$/i, '');
+function cleanEpisodeDirName(fulltitle: string | null | undefined, fallbackKey: string): string {
+  const cleaned = (typeof fulltitle === 'string' ? fulltitle : '').replace(/\.(mkv|mp4|avi|m4v|wmv|flv|mov|ts)$/i, '');
   return cleaned || fallbackKey;
 }
