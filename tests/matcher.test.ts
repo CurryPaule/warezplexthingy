@@ -10,6 +10,8 @@ import {
   matchesQuality,
   matchesTags,
   meetsLanguage,
+  normalizeLangCode,
+  normalizeTitle,
   parseEpisodeRange,
 } from '../src/matcher';
 
@@ -135,6 +137,27 @@ describe('quality, language, and tags filters', () => {
     expect(meetsLanguage(['GER'], 'DE')).toBe(true);
     expect(meetsLanguage(null, 'GER,ENG', 'Show.S01.GERMAN.DL.1080p')).toBe(true);
     expect(meetsLanguage(null, 'GER,ENG', 'Show.S01.GERMAN.1080p')).toBe(false);
+  });
+
+  it('handles null/empty elements in API lang arrays without crashing (Doctor Who warez.cx bug)', () => {
+    expect(normalizeLangCode(null)).toBe('');
+    expect(normalizeLangCode(undefined)).toBe('');
+    expect(
+      meetsLanguage([null], 'GER,ENG', 'Doctor.Who.S14.German.DL.EAC3.1080p.DSNP.WEB.H265-ZeroTwo'),
+    ).toBe(true);
+    expect(meetsLanguage([null], 'GER', 'Some.English.Only.1080p')).toBe(false);
+    expect(meetsLanguage(['GER', null, 'ENG'], 'GER,ENG')).toBe(true);
+  });
+
+  it('handles null/empty fulltitle and title inputs safely', () => {
+    expect(normalizeTitle(null)).toBe('');
+    expect(extractTitleFromFulltitle(null)).toBe('');
+    expect(extractSeason(null)).toBeNull();
+    expect(extractEpisode(null)).toBeNull();
+    expect(isSeasonPackFulltitle(null)).toBe(false);
+    expect(isSeasonPackFulltitle('')).toBe(false);
+    expect(matchesTags(null, ['HDR'])).toBe(false);
+    expect(matchesTags(null, null)).toBe(true);
   });
 
   it('matches tags as comma string or array', () => {

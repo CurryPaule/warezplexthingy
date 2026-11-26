@@ -2,12 +2,20 @@ import type { NocoDbClient } from '../nocodb/client';
 import type { MatchRow, WatchlistRow } from '../nocodb/types';
 import type { WarezClient } from '../warez/api';
 import type { WarezSearchEntry } from '../warez/types';
+import type { NtfyClient } from '../ntfy/client';
+import { formatErrorMessage, safeNotifyError } from '../ntfy/client';
 import type { Config } from '../config';
 import {
   normalizeTitle,
   meetsLanguage,
 } from '../matcher';
 import { sleep } from '../utils';
+
+export interface SearchOptions {
+  sleepFn?: (ms: number) => Promise<void>;
+  /** Optional ntfy client — sends an emergency error ping if any watchlist search fails */
+  ntfy?: NtfyClient;
+}
 
 /**
  * Build the search query for a watchlist item.
@@ -52,13 +60,12 @@ function entryMatchesWatchlistItem(entry: WarezSearchEntry, item: WatchlistRow):
 
   // Title-based match
   const watchTitle = normalizeTitle(item.Title);
+  if (!watchTitle) return false;
   const entryTitle = normalizeTitle(entry.title);
   const entryOriginal = normalizeTitle(entry.original_title || '');
 
-  return entryTitle === watchTitle
-    || entryOriginal === watchTitle
-    || entryTitle.includes(watchTitle)
-    || watchTitle.includes(entryTitle);
+  return (Boolean(entryTitle) && (entryTitle === watchTitle || entryTitle.includes(watchTitle) || watchTitle.includes(entryTitle)))
+    || (Boolean(entryOriginal) && entryOriginal === watchTitle);
 }
 
 /**
@@ -72,7 +79,9 @@ export async function runSearchScraper(
   warez: WarezClient,
   nocodb: NocoDbClient,
   config: Config,
+  options: SearchOptions = {},
 ): Promise<void> {
+  const sleepFn = options.sleepFn ?? sleep;
   console.log('▶ Search scraper starting...');
 
   const watchlist = await nocodb.getActiveWatchlist();
@@ -87,58 +96,74 @@ export async function runSearchScraper(
   }
 
   let totalMatched = 0;
+  let failed = 0;
+  const searchErrors: string[] = [];
 
   for (const item of toSearch) {
     const query = buildSearchQuery(item);
     console.log(`  🔍 Searching: "${query}" (${item.Type ?? 'any'})`);
 
-    let entries: WarezSearchEntry[];
     try {
-      entries = await warez.searchEntries(query);
-    } catch (err) {
-      console.error(`  ⚠ Search failed for "${query}":`, err);
-      await sleep(config.SEARCH_DELAY_MS);
-      continue;
-    }
+      const rawEntries = await warez.searchEntries(query);
+      const entries = Array.isArray(rawEntries)
+        ? rawEntries.filter((e): e is WarezSearchEntry => Boolean(e && typeof e === 'object'))
+        : [];
 
-    console.log(`     → ${entries.length} result(s)`);
+      console.log(`     → ${entries.length} result(s)`);
 
-    const matched = entries.filter(e => entryMatchesWatchlistItem(e, item));
+      const matched = entries.filter(e => entryMatchesWatchlistItem(e, item));
 
-    for (const entry of matched) {
-      const matchRecord: Omit<MatchRow, 'Id'> = {
-        WatchlistId: item.Id,
-        WarezId: entry.id,
-        WarezUid: entry.uid,
-        Title: entry.title,
-        Fulltitle: entry.fulltitle,
-        Type: entry.type,
-        Quality: '',
-        Lang: JSON.stringify(entry.lang),
-        Links: '{}',
-        CryptedLinks: '{}',
-        SizeBytes: 0,
-        ReleaseGroup: '',
-        ImdbId: entry.options?.imdb_id ?? '',
-        TmdbId: Number(entry.options?.tmdb_id) || 0,
-        WarezCreatedAt: '',
-        MatchedAt: new Date().toISOString(),
-        Status: 'found',
-      };
+      for (const entry of matched) {
+        const cleanLang = Array.isArray(entry.lang)
+          ? entry.lang.filter((l): l is string => typeof l === 'string' && l.trim().length > 0)
+          : [];
+        const matchRecord: Omit<MatchRow, 'Id'> = {
+          WatchlistId: item.Id,
+          WarezId: entry.id,
+          WarezUid: entry.uid,
+          Title: entry.title || item.Title,
+          Fulltitle: entry.fulltitle || entry.title || item.Title,
+          Type: entry.type || item.Type || 'movie',
+          Quality: '',
+          Lang: JSON.stringify(cleanLang),
+          Links: '{}',
+          CryptedLinks: '{}',
+          SizeBytes: 0,
+          ReleaseGroup: '',
+          ImdbId: entry.options?.imdb_id ?? '',
+          TmdbId: Number(entry.options?.tmdb_id) || 0,
+          WarezCreatedAt: '',
+          MatchedAt: new Date().toISOString(),
+          Status: 'found',
+        };
 
-      const isNew = await nocodb.upsertMatch(matchRecord);
-      if (!isNew) {
-        console.log(`  ⏩ Skipped (already exists): "${entry.title}"`);
-        continue;
+        const isNew = await nocodb.upsertMatch(matchRecord);
+        if (!isNew) {
+          console.log(`  ⏩ Skipped (already exists): "${matchRecord.Title}"`);
+          continue;
+        }
+
+        await nocodb.updateWatchlistLastMatched(item.Id, matchRecord.MatchedAt);
+        totalMatched++;
+        console.log(`  ✅ Match: [${item.Title}] ← "${matchRecord.Title}" (${matchRecord.Type}, IMDB: ${entry.options?.imdb_id ?? 'n/a'})`);
       }
-
-      await nocodb.updateWatchlistLastMatched(item.Id, matchRecord.MatchedAt);
-      totalMatched++;
-      console.log(`  ✅ Match: [${item.Title}] ← "${entry.title}" (${entry.type}, IMDB: ${entry.options?.imdb_id ?? 'n/a'})`);
+    } catch (err) {
+      const msg = formatErrorMessage(err);
+      console.error(`  ⚠ Search failed for "${item.Title}" (query "${query}"):`, err);
+      failed++;
+      searchErrors.push(`${item.Title} ("${query}"): ${msg}`);
     }
 
-    await sleep(config.SEARCH_DELAY_MS);
+    await sleepFn(config.SEARCH_DELAY_MS);
   }
 
-  console.log(`✔ Search done. Total new matches: ${totalMatched}`);
+  console.log(`✔ Search done. Total new matches: ${totalMatched}${failed > 0 ? `, Failed: ${failed}` : ''}`);
+
+  if (searchErrors.length > 0) {
+    await safeNotifyError(options.ntfy, {
+      source: 'search',
+      summary: `${searchErrors.length} watchlist search(es) failed`,
+      errors: searchErrors,
+    });
+  }
 }

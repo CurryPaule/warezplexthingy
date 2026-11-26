@@ -9,6 +9,8 @@ import type {
   WarezSearchResponse,
 } from './types';
 
+const WAREZ_FETCH_TIMEOUT_MS = 30_000;
+
 export class WarezClient {
   private baseUrl: string;
   private headers: Record<string, string>;
@@ -25,6 +27,16 @@ export class WarezClient {
     }
   }
 
+  private async fetchWithTimeout(url: string): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), WAREZ_FETCH_TIMEOUT_MS);
+    try {
+      return await fetch(url, { headers: this.headers, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async fetchReleases(params: WarezFetchParams = {}): Promise<WarezApiResponse> {
     const query = new URLSearchParams();
     if (params.q !== undefined) query.set('q', params.q);
@@ -38,7 +50,7 @@ export class WarezClient {
 
     const url = `${this.baseUrl}/start/release?${query.toString()}`;
 
-    const response = await fetch(url, { headers: this.headers });
+    const response = await this.fetchWithTimeout(url);
     if (!response.ok) {
       throw new Error(`warez API error ${response.status}: ${await response.text()}`);
     }
@@ -58,12 +70,13 @@ export class WarezClient {
     let page = 1;
     while (true) {
       const data = await this.fetchReleases({ ...params, page });
-      const batch = data.items.data;
+      const batch = Array.isArray(data?.items?.data) ? data.items.data : [];
 
       yield batch;
 
       if (stopCondition && stopCondition(batch)) break;
-      if (page >= data.items.last_page) break;
+      const lastPage = data?.items?.last_page ?? page;
+      if (page >= lastPage) break;
       if (maxPages > 0 && page >= maxPages) break;
 
       page++;
@@ -85,15 +98,17 @@ export class WarezClient {
       params.set('page', String(page));
 
       const url = `${this.baseUrl}/start/search?${params.toString()}`;
-      const response = await fetch(url, { headers: this.headers });
+      const response = await this.fetchWithTimeout(url);
       if (!response.ok) {
         throw new Error(`warez search API error ${response.status}: ${await response.text()}`);
       }
 
       const data = await response.json() as WarezSearchResponse;
-      results.push(...data.items.data);
+      const batch = Array.isArray(data?.items?.data) ? data.items.data : [];
+      results.push(...batch);
 
-      if (page >= data.items.last_page) break;
+      const lastPage = data?.items?.last_page ?? page;
+      if (page >= lastPage) break;
       page++;
 
       // Safety cap
@@ -109,11 +124,14 @@ export class WarezClient {
    */
   async fetchEntryDetail(uid: string): Promise<WarezEntryDetail> {
     const url = `${this.baseUrl}/start/d/${uid}`;
-    const response = await fetch(url, { headers: this.headers });
+    const response = await this.fetchWithTimeout(url);
     if (!response.ok) {
       throw new Error(`warez detail API error ${response.status}: ${await response.text()}`);
     }
     const data = await response.json() as WarezDetailResponse;
+    if (!data?.item) {
+      throw new Error(`warez detail API returned empty item for "${uid}"`);
+    }
     return data.item;
   }
 

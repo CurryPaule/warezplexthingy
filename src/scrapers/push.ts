@@ -4,6 +4,7 @@ import type { CrawledLink, CrawledPackage, JDownloaderClient } from '../jdownloa
 import type { WarezClient } from '../warez/api';
 import type { WarezDetailRelease } from '../warez/types';
 import type { NtfyClient } from '../ntfy/client';
+import { formatErrorMessage, safeNotifyError } from '../ntfy/client';
 import type { Config } from '../config';
 import {
   buildEpisodesPattern,
@@ -60,12 +61,13 @@ export interface PushCandidate {
 }
 
 export function isCloudflareContainerUrl(url: string): boolean {
+  if (typeof url !== 'string') return false;
   return CLOUDFLARE_CONTAINER_PATTERN.test(url.trim());
 }
 
 export function isCloudflareBlockedLink(link: CrawledLink): boolean {
   return (
-    CLOUDFLARE_BLOCK_PATTERN.test(link.name) ||
+    CLOUDFLARE_BLOCK_PATTERN.test(link.name ?? '') ||
     CLOUDFLARE_BLOCK_PATTERN.test(link.status ?? '')
   );
 }
@@ -405,8 +407,8 @@ export function findPushedLinks(
   // Primary: match by package saveTo (contains our unique metadata path) or exact package name
   const matchedPackageUuids = new Set<string>();
   for (const pkg of packages) {
-    const saveToLower = pkg.saveTo.toLowerCase();
-    const nameLower = pkg.name.toLowerCase();
+    const saveToLower = (pkg.saveTo ?? '').toLowerCase();
+    const nameLower = (pkg.name ?? '').toLowerCase();
     if (
       (metadataLower && saveToLower.includes(metadataLower)) ||
       (packageNameLower && nameLower === packageNameLower)
@@ -764,7 +766,10 @@ async function tryAlternateWarezReleases(
   let releases: WarezDetailRelease[];
   try {
     const detail = await warez.fetchEntryDetail(match.WarezUid);
-    releases = detail.releases ?? [];
+    const rawReleases = Array.isArray(detail?.releases) ? detail.releases : [];
+    releases = rawReleases.filter(
+      (r): r is WarezDetailRelease => Boolean(r && typeof r === 'object'),
+    );
   } catch (err) {
     console.warn(
       `  ⚠ Could not fetch alternate warez.cx releases for "${match.Title}":`,
@@ -806,8 +811,8 @@ async function tryAlternateWarezReleases(
     const links: Record<string, string[]> = {};
     const cryptedLinks: Record<string, string> = {};
     for (const hoster of onlineHosters) {
-      if (rel.links[hoster]) links[hoster] = rel.links[hoster];
-      if (rel.crypted_links[hoster]) cryptedLinks[hoster] = rel.crypted_links[hoster];
+      if (rel.links?.[hoster]) links[hoster] = rel.links[hoster];
+      if (rel.crypted_links?.[hoster]) cryptedLinks[hoster] = rel.crypted_links[hoster];
     }
 
     const altCandidates = buildPushCandidates(
@@ -936,32 +941,33 @@ export async function runPushScraper(
   let pushed = 0;
   let skipped = 0;
   let failed = 0;
+  const unexpectedErrors: { label: string; uid?: string; title?: string; message: string }[] = [];
 
   for (const match of matched) {
-    const packageName = match.Fulltitle || match.Title;
+    const packageName = match.Fulltitle || match.Title || `Match #${match.Id}`;
 
-    // Avoid re-attempting and spamming ntfy on subsequent cron runs for matches already handed off manually
-    if (options.ntfy && typeof nocodb.getState === 'function') {
-      const prevNotified = await nocodb.getState(buildManualNotifyStateKey(match.Id)).catch(() => null);
-      if (prevNotified === buildManualNotifyToken(match)) {
-        console.log(`  ⏭ Skipping "${packageName}" (already notified for manual download)`);
+    try {
+      // Avoid re-attempting and spamming ntfy on subsequent cron runs for matches already handed off manually
+      if (options.ntfy && typeof nocodb.getState === 'function') {
+        const prevNotified = await nocodb.getState(buildManualNotifyStateKey(match.Id)).catch(() => null);
+        if (prevNotified === buildManualNotifyToken(match)) {
+          console.log(`  ⏭ Skipping "${packageName}" (already notified for manual download)`);
+          skipped++;
+          continue;
+        }
+      }
+
+      const candidates = buildPushCandidates(match, hosterPriority);
+
+      if (candidates.length === 0) {
+        console.log(`  ⚠ No downloadable links found for "${match.Fulltitle}" — skipping`);
         skipped++;
         continue;
       }
-    }
 
-    const candidates = buildPushCandidates(match, hosterPriority);
+      const metadataPath = buildMetadataPath(match);
+      const filterRange = getEpisodeFilterRange(match);
 
-    if (candidates.length === 0) {
-      console.log(`  ⚠ No downloadable links found for "${match.Fulltitle}" — skipping`);
-      skipped++;
-      continue;
-    }
-
-    const metadataPath = buildMetadataPath(match);
-    const filterRange = getEpisodeFilterRange(match);
-
-    try {
       let pushSucceeded = false;
       let alternateUpdate: Partial<MatchRow> | null = null;
       const failureReasons: string[] = [];
@@ -1086,16 +1092,19 @@ export async function runPushScraper(
             checkOnline,
           );
           if (alt) {
+            const cleanLang = Array.isArray(alt.release.lang)
+              ? alt.release.lang.filter((l): l is string => typeof l === 'string' && l.trim().length > 0)
+              : [];
             alternateUpdate = {
               WarezId: alt.release.id,
-              Fulltitle: alt.release.fulltitle,
+              Fulltitle: alt.release.fulltitle ?? '',
               Quality: alt.release.quality ?? match.Quality,
-              Lang: JSON.stringify(alt.release.lang),
+              Lang: JSON.stringify(cleanLang),
               Links: JSON.stringify(alt.links),
               CryptedLinks: JSON.stringify(alt.cryptedLinks),
-              SizeBytes: alt.release.size,
-              ReleaseGroup: alt.release.group,
-              WarezCreatedAt: alt.release.created_at,
+              SizeBytes: alt.release.size ?? 0,
+              ReleaseGroup: alt.release.group ?? '',
+              WarezCreatedAt: alt.release.created_at ?? '',
             };
             pushSucceeded = true;
           }
@@ -1120,12 +1129,32 @@ export async function runPushScraper(
         );
       }
     } catch (err) {
+      const msg = formatErrorMessage(err);
       failed++;
-      console.warn(`  ⚠ Push failed for "${packageName}":`, err instanceof Error ? err.message : err);
+      console.warn(`  ⚠ Push failed for "${packageName}":`, msg);
+      unexpectedErrors.push({
+        label: packageName,
+        uid: match.WarezUid,
+        title: match.Title,
+        message: msg,
+      });
     }
 
     await pollOpts.sleepFn(config.SEARCH_DELAY_MS);
   }
 
   console.log(`✔ Push done. Pushed: ${pushed}, Skipped: ${skipped}, Failed: ${failed}`);
+
+  if (unexpectedErrors.length > 0) {
+    const single = unexpectedErrors.length === 1 ? unexpectedErrors[0]! : undefined;
+    await safeNotifyError(options.ntfy, {
+      source: 'push',
+      summary: single
+        ? `${single.label} failed`
+        : `${unexpectedErrors.length} item(s) failed during push`,
+      errors: unexpectedErrors.map(e => `${e.label}: ${e.message}`),
+      warezUid: single?.uid,
+      title: single?.title,
+    });
+  }
 }

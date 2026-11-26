@@ -1,6 +1,8 @@
 import type { Config } from '../config';
 import type { OmbiMovieRequest, OmbiTvRequest } from './types';
 
+const OMBI_FETCH_TIMEOUT_MS = 30_000;
+
 /**
  * Ombi REST API client (v1).
  * Auth: `ApiKey` header with Ombi API key (found in Ombi Settings → Configuration → General).
@@ -21,12 +23,23 @@ export class OmbiClient {
     };
   }
 
+  private async fetchWithTimeout(url: string, method: 'GET' | 'POST'): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), OMBI_FETCH_TIMEOUT_MS);
+    try {
+      return await fetch(url, {
+        method,
+        headers: this.headers,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private async request<T>(path: string): Promise<T> {
     const url = `${this.baseUrl}${path}`;
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: this.headers,
-    });
+    const response = await this.fetchWithTimeout(url, 'GET');
     if (!response.ok) {
       const text = await response.text();
       throw new Error(`Ombi GET ${path} → ${response.status}: ${text}`);
@@ -49,10 +62,7 @@ export class OmbiClient {
   /** Trigger Ombi's Plex Recently Added sync job (POST /api/v1/Job/plexrecentlyadded) */
   async triggerPlexRecentlyAddedSync(): Promise<void> {
     const url = `${this.baseUrl}/api/v1/Job/plexrecentlyadded`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: this.headers,
-    });
+    const response = await this.fetchWithTimeout(url, 'POST');
     if (!response.ok) {
       const text = await response.text();
       throw new Error(`Ombi POST /api/v1/Job/plexrecentlyadded → ${response.status}: ${text}`);
@@ -62,10 +72,7 @@ export class OmbiClient {
   /** Health / status check (returns HTTP status text or version info) */
   async getStatus(): Promise<string> {
     const url = `${this.baseUrl}/api/v1/Status`;
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: this.headers,
-    });
+    const response = await this.fetchWithTimeout(url, 'GET');
     if (!response.ok) {
       const text = await response.text();
       throw new Error(`Ombi GET /api/v1/Status → ${response.status}: ${text}`);

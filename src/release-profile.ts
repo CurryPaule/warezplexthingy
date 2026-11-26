@@ -47,14 +47,15 @@ const CODEC_265_TOKENS = new Set(['265', 'h265', 'h.265', 'x265', 'hevc']);
 const CODEC_264_TOKENS = new Set(['264', 'h264', 'h.264', 'x264', 'avc']);
 
 /** Returns true when a watchlist row has at least one manual tag configured */
-export function hasManualTags(tags: string | string[] | undefined | null): boolean {
+export function hasManualTags(tags: string | readonly (string | null | undefined)[] | undefined | null): boolean {
   if (!tags) return false;
-  const list = Array.isArray(tags) ? tags : tags.split(',');
-  return list.some(t => t.trim().length > 0);
+  const list = Array.isArray(tags) ? tags : typeof tags === 'string' ? tags.split(',') : [];
+  return list.some(t => typeof t === 'string' && t.trim().length > 0);
 }
 
 /** Extract the metadata tail of a fulltitle (after title) so title words like "Max" or "Sky" aren't misidentified as sources */
-function getMetadataSection(fulltitle: string): string {
+function getMetadataSection(fulltitle: string | null | undefined): string {
+  if (typeof fulltitle !== 'string' || !fulltitle) return '';
   const match = METADATA_START_PATTERN.exec(fulltitle);
   if (match && match.index !== undefined) {
     return fulltitle.slice(match.index);
@@ -63,13 +64,13 @@ function getMetadataSection(fulltitle: string): string {
 }
 
 /** Detect HDR/DV vs SDR from a release's fulltitle */
-export function extractDynamicRange(fulltitle: string): DynamicRange {
+export function extractDynamicRange(fulltitle: string | null | undefined): DynamicRange {
   return HDR_PATTERN.test(getMetadataSection(fulltitle)) ? 'HDR' : 'SDR';
 }
 
 /** Detect video codec tier (265 vs 264) from video_codec field or fulltitle */
 export function extractCodec(release: Pick<WarezDetailRelease, 'video_codec' | 'fulltitle'>): VideoCodecTier | undefined {
-  const vc = release.video_codec?.trim() ?? '';
+  const vc = typeof release.video_codec === 'string' ? release.video_codec.trim() : '';
   if (vc) {
     if (/265|hevc/i.test(vc)) return '265';
     if (/264|avc/i.test(vc)) return '264';
@@ -81,7 +82,7 @@ export function extractCodec(release: Pick<WarezDetailRelease, 'video_codec' | '
 }
 
 /** Detect streaming/disc source tag from the release metadata portion of fulltitle */
-export function extractSource(fulltitle: string): string | undefined {
+export function extractSource(fulltitle: string | null | undefined): string | undefined {
   const meta = getMetadataSection(fulltitle);
   for (const { canonical, pattern } of KNOWN_SOURCES) {
     if (pattern.test(meta)) {
@@ -93,12 +94,13 @@ export function extractSource(fulltitle: string): string | undefined {
 
 /** Extract release group from API group field or trailing -GROUP suffix */
 export function extractGroup(release: Pick<WarezDetailRelease, 'group' | 'fulltitle'>): string | undefined {
-  const apiGroup = release.group?.trim();
+  const apiGroup = typeof release.group === 'string' ? release.group.trim() : '';
   if (apiGroup && !IGNORED_GROUPS.has(apiGroup.toLowerCase())) {
     return apiGroup;
   }
 
-  const withoutExt = release.fulltitle.replace(/\.(mkv|mp4|avi|m4v|ts)$/i, '').trim();
+  const fulltitle = typeof release.fulltitle === 'string' ? release.fulltitle : '';
+  const withoutExt = fulltitle.replace(/\.(mkv|mp4|avi|m4v|ts)$/i, '').trim();
   const suffixMatch = /-([A-Za-z0-9]+)$/.exec(withoutExt);
   if (suffixMatch) {
     const candidate = suffixMatch[1]!;
@@ -112,7 +114,8 @@ export function extractGroup(release: Pick<WarezDetailRelease, 'group' | 'fullti
 
 /** Check if release is Dual Language (GER + ENG/other or DL/DUAL/MULTI tag) */
 export function isDualLanguage(release: Pick<WarezDetailRelease, 'lang' | 'fulltitle'>): boolean {
-  const langs = (release.lang ?? []).map(l => normalizeLangCode(l)).filter(Boolean);
+  const rawLangs = Array.isArray(release.lang) ? release.lang : [];
+  const langs = rawLangs.map(l => normalizeLangCode(l)).filter(Boolean);
   if (langs.includes('GER') && langs.length >= 2) return true;
   return DL_PATTERN.test(getMetadataSection(release.fulltitle));
 }
@@ -151,7 +154,7 @@ export function matchesAutoTags(
   autoTags: string | undefined | null,
   mode: 'strict' | 'relaxed' = 'strict',
 ): boolean {
-  if (!autoTags) return true;
+  if (typeof autoTags !== 'string' || !autoTags) return true;
   const tokens = autoTags
     .split(',')
     .map(t => t.trim())
@@ -160,7 +163,8 @@ export function matchesAutoTags(
   if (tokens.length === 0) return true;
 
   const profile = extractReleaseProfile(release);
-  const fulltitleLower = release.fulltitle.toLowerCase();
+  const fulltitle = typeof release.fulltitle === 'string' ? release.fulltitle : '';
+  const fulltitleLower = fulltitle.toLowerCase();
   const groupLower = profile.group?.toLowerCase();
 
   for (const rawToken of tokens) {
@@ -190,7 +194,7 @@ export function matchesAutoTags(
 
     // Strict check for source / group / custom token
     if (token === 'bluray') {
-      if (!/blu-?ray/i.test(release.fulltitle)) return false;
+      if (!/blu-?ray/i.test(fulltitle)) return false;
       continue;
     }
     if (groupLower && groupLower === token) {
@@ -209,7 +213,7 @@ export function matchesAutoTags(
  * DynamicRange + Codec (i.e. whether relaxed fallback can actually broaden the search).
  */
 export function hasRelaxableAutoTags(autoTags: string | undefined | null): boolean {
-  if (!autoTags) return false;
+  if (typeof autoTags !== 'string' || !autoTags) return false;
   const tokens = autoTags
     .split(',')
     .map(t => t.trim().toLowerCase())
@@ -261,17 +265,20 @@ function getEpisodeCountSafe(release: WarezDetailRelease): number {
 }
 
 /** Parse comma-separated or array preferred release group list into lowercase priority array */
-export function parsePreferredGroups(raw?: string | string[] | null): string[] {
+export function parsePreferredGroups(raw?: string | readonly (string | null | undefined)[] | null): string[] {
   if (!raw) return [];
-  const list = Array.isArray(raw) ? raw : raw.split(',');
-  return list.map(g => g.trim().toLowerCase()).filter(Boolean);
+  const list = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(',') : [];
+  return list
+    .filter((g): g is string => typeof g === 'string')
+    .map(g => g.trim().toLowerCase())
+    .filter(Boolean);
 }
 
 /** Rank media source quality: 0 = BluRay (BD), 1 = WEB / WEB-DL, 2 = other (BDRip, HDTV, etc.) */
 export function getMediaSourceRank(
   release: Pick<WarezDetailRelease, 'video_stream' | 'fulltitle'>,
 ): number {
-  const vs = (release.video_stream ?? '').trim().toUpperCase();
+  const vs = typeof release.video_stream === 'string' ? release.video_stream.trim().toUpperCase() : '';
   if (vs === 'BD' || vs === 'BLURAY' || vs === 'BLU-RAY') return 0;
   if (vs === 'WEB' || vs === 'WEB-DL' || vs === 'WEBRIP') return 1;
 

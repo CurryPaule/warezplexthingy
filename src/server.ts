@@ -7,7 +7,7 @@ import { WarezClient } from './warez/api';
 import { JDownloaderClient } from './jdownloader/client';
 import { FileBrowserClient } from './filebrowser/client';
 import { OmbiClient } from './ombi/client';
-import { NtfyClient, isNtfyConfigured } from './ntfy/client';
+import { NtfyClient, isNtfyConfigured, formatErrorMessage, safeNotifyError } from './ntfy/client';
 import {
   classifyOmbiWebhookEvent,
   isWebhookAuthorized,
@@ -21,6 +21,7 @@ import { sortDownload, parseDownloadMetadata as parseDownloadMetadataCheck } fro
 
 export interface ServerDeps {
   logger?: boolean;
+  ntfy?: NtfyClient;
   runOmbiSyncFn?: () => Promise<OmbiSyncSummary>;
   runSearchFn?: () => Promise<void>;
   runEnrichFn?: () => Promise<void>;
@@ -45,19 +46,19 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
 
   const nocodb = new NocoDbClient(config);
   const warez = new WarezClient(config);
-  const ntfy = isNtfyConfigured(config) ? new NtfyClient(config) : undefined;
+  const ntfy = deps.ntfy ?? (isNtfyConfigured(config) ? new NtfyClient(config) : undefined);
 
   const execOmbiSync = deps.runOmbiSyncFn ?? (async () => {
     const ombi = new OmbiClient(config);
-    return runOmbiSync(ombi, nocodb, config);
+    return runOmbiSync(ombi, nocodb, config, { ntfy });
   });
 
   const execSearch = deps.runSearchFn ?? (async () => {
-    await runSearchScraper(warez, nocodb, config);
+    await runSearchScraper(warez, nocodb, config, { ntfy });
   });
 
   const execEnrich = deps.runEnrichFn ?? (async () => {
-    await runEnrichScraper(warez, nocodb, config);
+    await runEnrichScraper(warez, nocodb, config, { ntfy });
   });
 
   const execPush = deps.runPushFn ?? (async () => {
@@ -81,6 +82,7 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
 
   async function executePipeline(mode: 'full' | BackgroundMode): Promise<Record<string, string>> {
     const results: Record<string, string> = {};
+    const stepErrors: string[] = [];
     let syncSummary: OmbiSyncSummary | null = null;
 
     // Step 0: Ombi Sync
@@ -91,12 +93,20 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
       } catch (err) {
         app.log.error(err, 'Workflow: ombi-sync failed');
         results.ombiSync = `error: ${err}`;
+        stepErrors.push(`ombi-sync: ${formatErrorMessage(err)}`);
       }
     } else {
       results.ombiSync = 'skipped (not configured)';
     }
 
     if (mode === 'sync-only') {
+      if (stepErrors.length > 0) {
+        await safeNotifyError(ntfy, {
+          source: 'workflow',
+          summary: `${stepErrors.length} pipeline step(s) failed`,
+          errors: stepErrors,
+        });
+      }
       return results;
     }
 
@@ -118,6 +128,7 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
     } catch (err) {
       app.log.error(err, 'Workflow: search failed');
       results.search = `error: ${err}`;
+      stepErrors.push(`search: ${formatErrorMessage(err)}`);
     }
 
     // Step 2: Enrich
@@ -127,6 +138,7 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
     } catch (err) {
       app.log.error(err, 'Workflow: enrich failed');
       results.enrich = `error: ${err}`;
+      stepErrors.push(`enrich: ${formatErrorMessage(err)}`);
     }
 
     // Step 3: Push
@@ -136,6 +148,15 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
     } catch (err) {
       app.log.error(err, 'Workflow: push failed');
       results.push = `error: ${err}`;
+      stepErrors.push(`push: ${formatErrorMessage(err)}`);
+    }
+
+    if (stepErrors.length > 0) {
+      await safeNotifyError(ntfy, {
+        source: 'workflow',
+        summary: `${stepErrors.length} pipeline step(s) failed`,
+        errors: stepErrors,
+      });
     }
 
     return results;
@@ -151,6 +172,13 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
         console.log(`▶ Ombi webhook background run starting (mode: ${mode})...`);
         await executePipeline(mode);
       }
+    } catch (err) {
+      app.log.error(err, 'Ombi webhook background pipeline failed');
+      await safeNotifyError(ntfy, {
+        source: 'ombi-webhook',
+        summary: 'Background workflow crashed',
+        errors: [formatErrorMessage(err)],
+      });
     } finally {
       workflowInFlight = false;
     }
@@ -233,6 +261,11 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
       return { status: 'ok', mode: 'ombi-sync', summary };
     } catch (err) {
       app.log.error(err, 'Ombi sync failed');
+      await safeNotifyError(ntfy, {
+        source: 'ombi-sync',
+        summary: 'Ombi sync failed',
+        errors: [formatErrorMessage(err)],
+      });
       reply.status(500);
       return { status: 'error', mode: 'ombi-sync', error: String(err) };
     }
@@ -292,10 +325,15 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
 
   app.post('/api/search', async (_req: FastifyRequest, reply: FastifyReply) => {
     try {
-      await runSearchScraper(warez, nocodb, config);
+      await execSearch();
       return { status: 'ok', mode: 'search' };
     } catch (err) {
       app.log.error(err, 'Search scraper failed');
+      await safeNotifyError(ntfy, {
+        source: 'search',
+        summary: 'Search scraper failed',
+        errors: [formatErrorMessage(err)],
+      });
       reply.status(500);
       return { status: 'error', mode: 'search', error: String(err) };
     }
@@ -305,10 +343,15 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
 
   app.post('/api/enrich', async (_req: FastifyRequest, reply: FastifyReply) => {
     try {
-      await runEnrichScraper(warez, nocodb, config);
+      await execEnrich();
       return { status: 'ok', mode: 'enrich' };
     } catch (err) {
       app.log.error(err, 'Enrich scraper failed');
+      await safeNotifyError(ntfy, {
+        source: 'enrich',
+        summary: 'Enrich scraper failed',
+        errors: [formatErrorMessage(err)],
+      });
       reply.status(500);
       return { status: 'error', mode: 'enrich', error: String(err) };
     }
@@ -317,20 +360,18 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
   // ─── Push ────────────────────────────────────────────────────────────────────
 
   app.post('/api/push', async (_req: FastifyRequest, reply: FastifyReply) => {
-    let jdownloader: JDownloaderClient | null = null;
     try {
-      jdownloader = new JDownloaderClient(config);
-      await jdownloader.connect();
-      await runPushScraper(jdownloader, nocodb, config, { warez, ntfy });
+      await execPush();
       return { status: 'ok', mode: 'push' };
     } catch (err) {
       app.log.error(err, 'Push scraper failed');
+      await safeNotifyError(ntfy, {
+        source: 'push',
+        summary: 'Push scraper failed',
+        errors: [formatErrorMessage(err)],
+      });
       reply.status(500);
       return { status: 'error', mode: 'push', error: String(err) };
-    } finally {
-      if (jdownloader) {
-        await jdownloader.disconnect().catch(() => {});
-      }
     }
   });
 
@@ -358,6 +399,11 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
       return { status: hasErrors ? 'partial' : 'ok', mode: 'workflow', results };
     } catch (err) {
       app.log.error(err, 'Workflow failed');
+      await safeNotifyError(ntfy, {
+        source: 'workflow',
+        summary: 'Workflow failed',
+        errors: [formatErrorMessage(err)],
+      });
       reply.status(500);
       return { status: 'error', mode: 'workflow', error: String(err) };
     } finally {
@@ -433,6 +479,11 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
           movedFiles: result.movedFiles,
         };
       } else {
+        await safeNotifyError(ntfy, {
+          source: 'sort',
+          summary: `Sort failed for ${metadataDirName}`,
+          errors: [result.error || 'Unknown sort error', `Path: ${downloadPath}`],
+        });
         reply.status(422);
         return {
           status: 'error',
@@ -442,6 +493,11 @@ export function buildServer(config: Config, deps: ServerDeps = {}): FastifyInsta
       }
     } catch (err) {
       app.log.error(err, 'Sort failed');
+      await safeNotifyError(ntfy, {
+        source: 'sort',
+        summary: `Sort crashed for ${metadataDirName}`,
+        errors: [formatErrorMessage(err), `Path: ${downloadPath}`],
+      });
       reply.status(500);
       return { status: 'error', mode: 'sort', error: String(err) };
     }

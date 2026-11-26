@@ -3,6 +3,7 @@ import { buildServer } from '../src/server';
 import { classifyOmbiWebhookEvent, isWebhookAuthorized } from '../src/ombi/webhook';
 import { parseConfig } from '../src/config';
 import type { OmbiSyncSummary } from '../src/scrapers/ombi-sync';
+import type { NtfyClient } from '../src/ntfy/client';
 
 const BASE_ENV = {
   NOCODB_URL: 'http://localhost:8080',
@@ -191,6 +192,57 @@ describe('POST /api/ombi-webhook', () => {
     expect(runSearchFn).toHaveBeenCalledTimes(1);
     expect(runEnrichFn).toHaveBeenCalledTimes(1);
     expect(runPushFn).toHaveBeenCalledTimes(1);
+
+    await app.close();
+  });
+
+  it('sends an ntfy error alert and continues pipeline when a workflow step throws', async () => {
+    const cfg = parseConfig(BASE_ENV);
+    const notifyError = vi.fn(async () => {});
+    const mockNtfy = { notifyError } as unknown as NtfyClient;
+
+    const runOmbiSyncFn = vi.fn(async (): Promise<OmbiSyncSummary> => ({
+      created: 0,
+      createdActive: 0,
+      activated: 0,
+      deactivated: 0,
+      updated: 0,
+      unchanged: 1,
+    }));
+    const runSearchFn = vi.fn(async () => {});
+    const runEnrichFn = vi.fn(async () => {
+      throw new Error('Unexpected enrich crash');
+    });
+    const runPushFn = vi.fn(async () => {});
+
+    const app = buildServer(cfg, {
+      logger: false,
+      ntfy: mockNtfy,
+      runOmbiSyncFn,
+      runSearchFn,
+      runEnrichFn,
+      runPushFn,
+    });
+
+    const res = await app.inject({ method: 'POST', url: '/api/workflow' });
+    expect(res.statusCode).toBe(207);
+    expect(res.json()).toMatchObject({
+      status: 'partial',
+      results: {
+        ombiSync: 'ok',
+        search: 'ok',
+        enrich: expect.stringContaining('Unexpected enrich crash'),
+        push: 'ok',
+      },
+    });
+    expect(runPushFn).toHaveBeenCalledTimes(1);
+    expect(notifyError).toHaveBeenCalledTimes(1);
+    expect(notifyError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: 'workflow',
+        errors: [expect.stringContaining('enrich: Unexpected enrich crash')],
+      }),
+    );
 
     await app.close();
   });

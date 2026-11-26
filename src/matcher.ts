@@ -10,7 +10,8 @@ const QUALITY_TIERS: Record<string, number> = {
 };
 
 /** Normalize a title for comparison: lowercase, replace separators with space, strip trailing year/junk */
-export function normalizeTitle(raw: string): string {
+export function normalizeTitle(raw: string | null | undefined): string {
+  if (typeof raw !== 'string') return '';
   return raw
     .toLowerCase()
     .replace(/[._\-]/g, ' ')
@@ -23,8 +24,9 @@ export function normalizeTitle(raw: string): string {
  * e.g. "Ladies.First.2026.German.DL.2160p.DV..." → "ladies first"
  * e.g. "Mating.Season.S01.GERMAN.DL..." → "mating season"
  */
-export function extractTitleFromFulltitle(fulltitle: string): string {
+export function extractTitleFromFulltitle(fulltitle: string | null | undefined): string {
   const normalized = normalizeTitle(fulltitle);
+  if (!normalized) return '';
 
   // Cut off at common release markers (only when not at start of title, e.g. movie "1917")
   const cutPatterns = [
@@ -51,12 +53,15 @@ export function extractTitleFromFulltitle(fulltitle: string): string {
 }
 
 /** Check if a release matches the required quality exactly */
-export function matchesQuality(releaseQuality: string | null, requiredQuality: string | undefined | null): boolean {
-  if (!requiredQuality) return true;
-  if (!releaseQuality) return false;
+export function matchesQuality(
+  releaseQuality: string | null | undefined,
+  requiredQuality: string | undefined | null,
+): boolean {
+  if (typeof requiredQuality !== 'string' || !requiredQuality.trim()) return true;
+  if (typeof releaseQuality !== 'string' || !releaseQuality.trim()) return false;
 
-  const relLower = releaseQuality.toLowerCase();
-  const reqLower = requiredQuality.toLowerCase();
+  const relLower = releaseQuality.trim().toLowerCase();
+  const reqLower = requiredQuality.trim().toLowerCase();
   const relTier = QUALITY_TIERS[relLower] ?? 0;
   const reqTier = QUALITY_TIERS[reqLower] ?? 0;
   if (reqTier === 0) return relLower === reqLower;
@@ -91,7 +96,8 @@ const FULLTITLE_LANG_MAP: Record<string, string[]> = {
  * Extract language codes from a release fulltitle.
  * Fallback when the API's `lang` array is null or empty.
  */
-export function extractLangsFromFulltitle(fulltitle: string): string[] {
+export function extractLangsFromFulltitle(fulltitle: string | null | undefined): string[] {
+  if (typeof fulltitle !== 'string' || !fulltitle) return [];
   const normalized = fulltitle.toLowerCase().replace(/[._\-]/g, ' ');
   const langs = new Set<string>();
   for (const [token, codes] of Object.entries(FULLTITLE_LANG_MAP)) {
@@ -148,71 +154,96 @@ const LANG_ALIASES: Record<string, string> = {
   POLISH: 'POL',
 };
 
-export function normalizeLangCode(code: string): string {
+export function normalizeLangCode(code: string | null | undefined): string {
+  if (typeof code !== 'string') return '';
   const upper = code.trim().toUpperCase();
   return LANG_ALIASES[upper] ?? upper;
 }
 
 /**
  * Check if a release includes all required languages.
- * Normalizes 2-letter ISO codes (e.g. "DE" → "GER") and falls back to parsing languages
- * from fulltitle when the API lang array is null/empty.
+ * Normalizes 2-letter ISO codes (e.g. "DE" → "GER"), ignores null/non-string entries
+ * (warez.cx sometimes returns `[null]`), and falls back to parsing languages from
+ * fulltitle when the API lang array has no valid codes.
  */
 export function meetsLanguage(
-  releaseLangs: string[] | null | undefined,
-  langRequired: string | undefined | null,
-  fulltitle?: string,
+  releaseLangs: readonly (string | null | undefined)[] | string | null | undefined,
+  langRequired: string | readonly (string | null | undefined)[] | undefined | null,
+  fulltitle?: string | null,
 ): boolean {
   if (!langRequired) return true;
-  const required = langRequired
-    .split(',')
+  const rawRequired = Array.isArray(langRequired)
+    ? langRequired
+    : typeof langRequired === 'string'
+      ? langRequired.split(',')
+      : [];
+  const required = rawRequired
     .map(l => normalizeLangCode(l))
     .filter(Boolean);
   if (required.length === 0) return true;
 
-  let available = (releaseLangs ?? []).map(l => normalizeLangCode(l)).filter(Boolean);
+  const rawAvailable = Array.isArray(releaseLangs)
+    ? releaseLangs
+    : typeof releaseLangs === 'string'
+      ? releaseLangs.split(',')
+      : [];
+  let available = rawAvailable.map(l => normalizeLangCode(l)).filter(Boolean);
 
-  // Fallback: parse language from fulltitle when API lang is missing
+  // Fallback: parse language from fulltitle when API lang is missing or contains only nulls
   if (available.length === 0 && fulltitle) {
-    available = extractLangsFromFulltitle(fulltitle).map(l => normalizeLangCode(l));
+    available = extractLangsFromFulltitle(fulltitle).map(l => normalizeLangCode(l)).filter(Boolean);
   }
 
   return required.every(req => available.includes(req));
 }
 
 /** Check if a release fulltitle contains all required tags (case-insensitive, AND logic) */
-export function matchesTags(fulltitle: string, tags: string | string[] | undefined | null): boolean {
+export function matchesTags(
+  fulltitle: string | null | undefined,
+  tags: string | readonly (string | null | undefined)[] | undefined | null,
+): boolean {
   if (!tags) return true;
   // NocoDB may return tags as a comma-separated string or as an array
-  const required = (Array.isArray(tags) ? tags : tags.split(','))
+  const rawTags = Array.isArray(tags)
+    ? tags
+    : typeof tags === 'string'
+      ? tags.split(',')
+      : [];
+  const required = rawTags
+    .filter((t): t is string => typeof t === 'string')
     .map(t => t.trim().toLowerCase())
     .filter(Boolean);
   if (required.length === 0) return true;
+  if (typeof fulltitle !== 'string' || !fulltitle) return false;
   const ft = fulltitle.toLowerCase();
   return required.every(tag => ft.includes(tag));
 }
 
 /** Extract season number from fulltitle, e.g. "S02" or "S02E05" → 2, null if not found */
-export function extractSeason(fulltitle: string): number | null {
+export function extractSeason(fulltitle: string | null | undefined): number | null {
+  if (typeof fulltitle !== 'string' || !fulltitle) return null;
   const match = /\bS(\d{2})(?=E\d|\b)/i.exec(fulltitle);
   if (!match) return null;
   return parseInt(match[1]!, 10);
 }
 
 /** Extract episode number from fulltitle, e.g. "S02E05" → 5, null if not found or season pack */
-export function extractEpisode(fulltitle: string): number | null {
+export function extractEpisode(fulltitle: string | null | undefined): number | null {
+  if (typeof fulltitle !== 'string' || !fulltitle) return null;
   const match = /\bS\d{2}E(\d{2,3})\b/i.exec(fulltitle);
   if (!match) return null;
   return parseInt(match[1]!, 10);
 }
 
 /** Returns true when a release fulltitle represents a season pack rather than an individual episode */
-export function isSeasonPackFulltitle(fulltitle: string): boolean {
+export function isSeasonPackFulltitle(fulltitle: string | null | undefined): boolean {
+  if (typeof fulltitle !== 'string' || !fulltitle.trim()) return false;
   return extractEpisode(fulltitle) === null;
 }
 
 /** Extract season + episode as a dedup key, e.g. "S02E05" → "S02E05", "S02" → "S02", null if none */
-export function extractSeasonEpisodeKey(fulltitle: string): string | null {
+export function extractSeasonEpisodeKey(fulltitle: string | null | undefined): string | null {
+  if (typeof fulltitle !== 'string' || !fulltitle) return null;
   // Try S01E05 first
   const full = /\b(S\d{2}E\d{2,3})\b/i.exec(fulltitle);
   if (full) return full[1]!.toUpperCase();
@@ -376,12 +407,16 @@ export function matchRelease(release: WarezRelease, watchlistItem: WatchlistRow)
   const releaseTitle = normalizeTitle(release.title);
   const extractedTitle = extractTitleFromFulltitle(release.fulltitle);
 
-  if (releaseTitle === watchTitle || extractedTitle === watchTitle) {
+  if (watchTitle && (releaseTitle === watchTitle || extractedTitle === watchTitle)) {
     return { matched: true, watchlistItem, reason: 'title match' };
   }
 
   // Substring match: watchlist title contained in release title (handles subtitle/year variations)
-  if (releaseTitle.includes(watchTitle) || watchTitle.includes(releaseTitle)) {
+  if (
+    watchTitle &&
+    releaseTitle &&
+    (releaseTitle.includes(watchTitle) || watchTitle.includes(releaseTitle))
+  ) {
     return { matched: true, watchlistItem, reason: 'title substring match' };
   }
 
